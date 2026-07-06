@@ -1,0 +1,52 @@
+{
+  "name": "@ftptech/x402-canton-next",
+  "version": "0.2.1",
+  "description": "Next.js App Router wrapper to gate Route Handlers behind Canton x402 payment via a facilitator.",
+  "license": "Apache-2.0",
+  "author": "FTP team",
+  "homepage": "https://github.com/sunstrike228/canton-x402-merchant#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sunstrike228/canton-x402-merchant.git",
+    "directory": "packages/next"
+  },
+  "bugs": {
+    "url": "https://github.com/sunstrike228/canton-x402-merchant/issues"
+  },
+  "keywords": [
+    "x402",
+    "canton",
+    "canton-network",
+    "nextjs",
+    "next",
+    "middleware",
+    "payment",
+    "402"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "lint": "eslint src --max-warnings 0"
+  },
+  "dependencies": {
+    "@ftptech/x402-canton-core": "^0.6.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
