@@ -42,7 +42,6 @@ function paymentSignature(): string {
     accepted: requirements(),
     payload: {
       assetTransferMethod: "transfer-factory",
-      payer: PAYER,
       submissionRef: "sub-1",
     },
   });
@@ -235,7 +234,6 @@ describe("withCantonPayment — SEC-1 requirements pinning", () => {
       accepted,
       payload: {
         assetTransferMethod: "transfer-factory",
-        payer: PAYER,
         submissionRef: "sub-1",
       },
     });
@@ -337,3 +335,123 @@ describe("withCantonPayment — config-time asset/instrumentId guard (audit L1)"
     ).toThrow(/disagrees/);
   });
 });
+
+describe("one payment, one delivery — across routes, not per route", () => {
+  // App Router applies withCantonPayment once per route file. The default
+  // store used to be built inside each call, so every route remembered its own
+  // redemptions and one settled payment unlocked every equally-priced route.
+  const settled = { isValid: true, payer: PAYER };
+  const okFetch = () =>
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/verify"))
+        return new Response(JSON.stringify(settled), { status: 200 });
+      if (url.endsWith("/settle"))
+        return new Response(
+          JSON.stringify({ success: true, transaction: "1220-one-and-only" }),
+          { status: 200 }
+        );
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as unknown as typeof globalThis.fetch;
+
+  const sig = encodeBase64Json({
+    x402Version: 2,
+    scheme: "exact",
+    network: "canton:devnet",
+    resource: { url: "https://app.example.com/api/data" },
+    accepted: requirements(),
+    payload: { assetTransferMethod: "transfer-factory", submissionRef: "sub-1" },
+  });
+  const route = (fetchImpl: typeof globalThis.fetch) =>
+    withCantonPayment(async () => Response.json({ data: "premium-payload" }), {
+      accepts: [requirements()],
+      facilitatorUrl: FACILITATOR,
+      description: "Premium data",
+      mimeType: "application/json",
+      fetch: fetchImpl,
+    });
+  const call = (h: ReturnType<typeof route>) =>
+    h(
+      new Request("https://app.example.com/api/data", {
+        headers: { [HEADER_PAYMENT_SIGNATURE_V2]: sig },
+      })
+    );
+
+  it("the SECOND route refuses the same settled payment", async () => {
+    const a = route(okFetch());
+    const b = route(okFetch());
+    expect((await call(a)).status).toBe(200); // paid for
+    expect((await call(b)).status).toBe(402); // used to be 200 — free
+  });
+
+  it("an explicitly passed store still wins, and null still disables", async () => {
+    // The discriminator. A merchant on several instances passes a SHARED store;
+    // the process-wide default must not quietly override it, and `null` must
+    // still restore the old unlimited-redemption behaviour on purpose.
+    const claims: string[] = [];
+    const mine = { claim: (id: string) => (claims.push(id), true) };
+    const a = withCantonPayment(async () => Response.json({ ok: true }), {
+      accepts: [requirements()],
+      facilitatorUrl: FACILITATOR,
+      description: "d",
+      mimeType: "application/json",
+      fetch: okFetch(),
+      redeemed: mine,
+    });
+    expect((await call(a)).status).toBe(200);
+    expect(claims).toEqual(["1220-one-and-only"]);
+
+    const open = withCantonPayment(async () => Response.json({ ok: true }), {
+      accepts: [requirements()],
+      facilitatorUrl: FACILITATOR,
+      description: "d",
+      mimeType: "application/json",
+      fetch: okFetch(),
+      redeemed: null,
+    });
+    expect((await call(open)).status).toBe(200);
+    expect((await call(open)).status).toBe(200);
+  });
+});
+
+/**
+ * Twin of the express case. The dedup ticket is the settle updateId; `?? ""`
+ * turned a missing one into a key EVERY payment shares, so the first claimed it
+ * and every later payment was refused after settling on-ledger. A published
+ * wrapper cannot assume a merchant-configured facilitator fills the field.
+ */
+describe("a settle with no transaction id is not deliverable", () => {
+  const handlerWith = (settle: { success: boolean; transaction?: string }) =>
+    withCantonPayment(async () => Response.json({ data: "premium-payload" }), {
+      accepts: [requirements()],
+      facilitatorUrl: FACILITATOR,
+      fetch: mockFacilitator({ isValid: true, payer: PAYER }, settle),
+      redeemed: (() => {
+        const seen = new Set<string>();
+        return { claim: async (id: string) => (seen.has(id) ? false : (seen.add(id), true)) };
+      })(),
+    });
+
+  const call = (h: ReturnType<typeof withCantonPayment>) =>
+    h(
+      new Request("https://app.example.com/api/data", {
+        headers: { "PAYMENT-SIGNATURE": paymentSignature() },
+      })
+    );
+
+  it("refuses to deliver, and says the payment may have settled", async () => {
+    const res = await call(handlerWith({ success: true }));
+    expect(res.status).toBe(502);
+    expect(JSON.stringify(await res.json())).toMatch(/do NOT pay again/);
+  });
+
+  it("treats an empty-string transaction the same way", async () => {
+    expect((await call(handlerWith({ success: true, transaction: "" }))).status).toBe(502);
+  });
+
+  it("still delivers on a conforming settle", async () => {
+    const res = await call(handlerWith({ success: true, transaction: "update-OK" }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ data: "premium-payload" });
+  });
+})

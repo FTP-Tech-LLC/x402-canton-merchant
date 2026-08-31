@@ -7,6 +7,7 @@ import {
   HEADER_PAYMENT_RESPONSE_V2,
   encodeBase64Json,
   decodeBase64Json,
+  createInMemoryRedeemedStore,
   type PaymentRequirements,
 } from "@ftptech/x402-canton-core";
 import { cantonPaymentMiddleware } from "./index.js";
@@ -44,7 +45,6 @@ function paymentSignature(): string {
     accepted: requirements(),
     payload: {
       assetTransferMethod: "transfer-factory",
-      payer: PAYER,
       submissionRef: "sub-1",
     },
   });
@@ -1025,7 +1025,6 @@ describe("cantonPaymentMiddleware — new coverage", () => {
       accepted: requirementsWithMemo,
       payload: {
         assetTransferMethod: "transfer-factory",
-        payer: PAYER,
         submissionRef: "sub-1",
       },
     });
@@ -1216,7 +1215,6 @@ describe("cantonPaymentMiddleware — new coverage", () => {
       accepted: requirements(),
       payload: {
         assetTransferMethod: "transfer-factory",
-        payer: PAYER,
         submissionRef: "sub-1",
       },
     });
@@ -1338,7 +1336,6 @@ describe("cantonPaymentMiddleware — SEC-1 requirements pinning", () => {
       accepted,
       payload: {
         assetTransferMethod: "transfer-factory",
-        payer: PAYER,
         submissionRef: "sub-1",
       },
     });
@@ -1429,7 +1426,6 @@ describe("cantonPaymentMiddleware — SEC-1 requirements pinning", () => {
       resource: { url: "http://127.0.0.1/api/data" },
       payload: {
         assetTransferMethod: "transfer-factory",
-        payer: PAYER,
         submissionRef: "sub-1",
       },
     });
@@ -1460,5 +1456,688 @@ describe("cantonPaymentMiddleware — config-time asset/instrumentId guard (audi
         routes: { "GET /api/data": { accepts: [bad] } },
       })
     ).toThrow(/disagrees/);
+  });
+});
+
+describe("one payment, one delivery (settle replay)", () => {
+  // The facilitator answers a REPEATED /settle of the same signed transaction
+  // with the recorded success and the ORIGINAL updateId. That is right for the
+  // payer and, on its own, wrong for the merchant: nothing in the protocol
+  // binds a settle to one delivery (the facilitator is never told which
+  // resource is being bought), so a payer who buys once could replay the same
+  // PAYMENT-SIGNATURE header until executeBefore passed and be served every
+  // time. This mock reproduces exactly that: one fixed updateId, always
+  // success — which is what the real facilitator does on a replay.
+  const replaying = () =>
+    facilitatorMock({ isValid: true, payer: PAYER }, { success: true, transaction: "1220-same-update-id" });
+
+  it("delivers the FIRST time and refuses the replay with 402", async () => {
+    const app = buildApp({ facilitatorFetch: replaying() });
+    const hdr = paymentSignature();
+
+    const first = await request(app).get("/api/data").set(HEADER_PAYMENT_SIGNATURE_V2, hdr);
+    expect(first.status).toBe(200);
+    expect(first.body).toEqual({ data: "premium-payload" });
+
+    const replay = await request(app).get("/api/data").set(HEADER_PAYMENT_SIGNATURE_V2, hdr);
+    expect(replay.status).toBe(402);
+    // 402 and not 500: "already redeemed, pay again for another" IS the x402
+    // answer, and it leaves an honest client able to buy a second unit.
+    const required = decodeBase64Json<{ error?: string }>(
+      replay.headers[HEADER_PAYMENT_REQUIRED_V2.toLowerCase()] as string
+    );
+    expect(required.error).toBe("payment_already_redeemed");
+  });
+
+  it("a DIFFERENT payment (different updateId) is unaffected", async () => {
+    // The discriminator: the gate must key on the settle updateId, not on the
+    // route or the payer. Keying on either would refuse honest repeat business.
+    let n = 0;
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/verify")) {
+        return new Response(JSON.stringify({ isValid: true, payer: PAYER }), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({ success: true, transaction: `1220-update-${n++}` }),
+        { status: 200 }
+      );
+    }) as typeof globalThis.fetch;
+
+    const app = buildApp({ facilitatorFetch: fetchImpl });
+    for (let i = 0; i < 3; i++) {
+      const r = await request(app).get("/api/data").set(HEADER_PAYMENT_SIGNATURE_V2, paymentSignature());
+      expect(r.status).toBe(200);
+    }
+  });
+
+  it("redeemed:null restores the old behaviour for anyone who needs it", async () => {
+    const app = express();
+    app.use(express.json());
+    app.use(
+      cantonPaymentMiddleware({
+        routes: { "GET /api/data": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch: replaying(),
+        redeemed: null,
+      })
+    );
+    app.get("/api/data", (_req, res) => res.json({ data: "premium-payload" }));
+
+    const hdr = paymentSignature();
+    expect((await request(app).get("/api/data").set(HEADER_PAYMENT_SIGNATURE_V2, hdr)).status).toBe(200);
+    expect((await request(app).get("/api/data").set(HEADER_PAYMENT_SIGNATURE_V2, hdr)).status).toBe(200);
+  });
+});
+
+describe("the gate must cover everything the express router will serve", () => {
+  // It used to look up an exact `${req.method} ${req.path}` string. Express
+  // defaults to case-insensitive, non-strict routing and answers HEAD from the
+  // GET handler, so the handler served strictly more paths than the gate
+  // covered — and every one of those was the paid resource, for free, with no
+  // payment header at all.
+  function gated(settings: Record<string, boolean> = {}) {
+    const app = express();
+    for (const [k, v] of Object.entries(settings)) app.set(k, v);
+    app.use(
+      cantonPaymentMiddleware({
+        routes: {
+          "GET /api/data": {
+            accepts: [requirements()],
+            description: "Premium data",
+            mimeType: "application/json",
+          },
+        },
+        facilitatorUrl: FACILITATOR,
+      })
+    );
+    app.get("/api/data", (_q, r) => {
+      r.json({ data: "premium-payload" });
+    });
+    app.get("/api/free", (_q, r) => {
+      r.json({ free: true });
+    });
+    return app;
+  }
+
+  it("a trailing slash, any casing, and HEAD all hit the gate", async () => {
+    for (const p of ["/api/data", "/api/data/", "/API/data", "/Api/Data/"]) {
+      const r = await request(gated()).get(p);
+      expect(r.status, `GET ${p}`).toBe(402);
+      expect(r.body, `GET ${p}`).not.toMatchObject({ data: "premium-payload" });
+    }
+    expect((await request(gated()).head("/api/data")).status).toBe(402);
+  });
+
+  it("an UNCONFIGURED route still falls through untouched", async () => {
+    // The gate must not become a wall. This is what next() is for.
+    const r = await request(gated()).get("/api/free");
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({ free: true });
+  });
+
+  it("with strict routing ON, the trailing-slash form is NOT gated on the app's own router", async () => {
+    // The gate must be exactly as loose as the router that will SERVE, and on
+    // the app's base router the app's flags describe exactly that router — so
+    // anything looser can only ever match a path the app will 404.
+    //
+    // That matters here far more than a spurious 402 would, because this
+    // middleware SETTLES before it calls next(). Briefly today the gate matched
+    // the loose form everywhere, and this shape measured as:
+    //
+    //   GET /api/data/  ->  404, and the settle had already happened
+    //
+    // The payer paid and got nothing. The loose reading is now applied only
+    // inside a mount, where an express.Router() genuinely ignores these flags.
+    const app = gated({ "strict routing": true });
+    expect((await request(app).get("/api/data")).status).toBe(402);
+    expect((await request(app).get("/api/data/")).status).toBe(404);
+  });
+
+  it("with case-sensitive routing ON, the other casing is NOT gated on the app's own router", async () => {
+    const app = gated({ "case sensitive routing": true });
+    expect((await request(app).get("/api/data")).status).toBe(402);
+    expect((await request(app).get("/API/data")).status).toBe(404);
+  });
+
+  it("gates a paid route on a sub-Router when the app enables strict routing", async () => {
+    // The case the two above were wrong about, and the one that cost a
+    // resource: express.Router() does not inherit the app's flags.
+    const app = express();
+    app.set("strict routing", true);
+    const r = express.Router();
+    r.use(
+      cantonPaymentMiddleware({
+        routes: { "GET /api/data": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch: facilitatorMock({ isValid: false, invalidReason: "nope" }, { success: false }),
+      })
+    );
+    r.get("/data", (_q, res) => res.json({ data: "premium-payload" }));
+    app.use("/api", r);
+    const res = await request(app).get("/api/data/");
+    expect(res.status).toBe(402);
+    expect(res.body).not.toHaveProperty("data");
+  });
+
+  it("and having charged for the mounted loose form, it DELIVERS it", async () => {
+    // The other half of the same rule: gating a path the router will serve is
+    // only correct if paying for it actually gets the resource. A gate that
+    // settles and then 404s is worse than one that never matched.
+    const app = express();
+    app.set("strict routing", true);
+    const r = express.Router();
+    r.use(
+      cantonPaymentMiddleware({
+        routes: { "GET /api/data": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch: facilitatorMock(
+          { isValid: true, payer: PAYER },
+          { success: true, transaction: "update-SUBROUTER", payer: PAYER }
+        ),
+      })
+    );
+    r.get("/data", (_q, res) => res.json({ data: "premium-payload" }));
+    app.use("/api", r);
+    const res = await request(app)
+      .get("/api/data/")
+      .set(HEADER_PAYMENT_SIGNATURE_V2, paymentSignature());
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ data: "premium-payload" });
+  });
+
+  it("two routes that express cannot tell apart are refused at setup", async () => {
+    // Silently gating one of them and serving the other free is worse than
+    // refusing to start.
+    expect(() =>
+      cantonPaymentMiddleware({
+        routes: {
+          "GET /api/data": { accepts: [requirements()], description: "a", mimeType: "application/json" },
+          "GET /API/data/": { accepts: [requirements()], description: "b", mimeType: "application/json" },
+        },
+        facilitatorUrl: FACILITATOR,
+      })
+    ).toThrow(/same route to express/);
+  });
+});
+
+/**
+ * The merchant middleware makes exactly two claims a payer acts on: "your
+ * payment was refused" (402) and "I could not confirm it" (502, do NOT pay
+ * again). Both were reachable only for the response shapes the FACILITATOR
+ * produces — and the shapes that actually appear in production come from the
+ * reverse proxy this repo ships in front of it.
+ */
+describe("cantonPaymentMiddleware — a facilitator that does not answer cleanly", () => {
+  const paid = { [HEADER_PAYMENT_SIGNATURE_V2]: paymentSignature() };
+
+  const facilitator = (opts: {
+    verify?: Response | (() => never);
+    settle?: Response | (() => never);
+  }): typeof globalThis.fetch =>
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/verify")) {
+        if (typeof opts.verify === "function") opts.verify();
+        return opts.verify ?? new Response(JSON.stringify({ isValid: true }), { status: 200 });
+      }
+      if (url.endsWith("/settle")) {
+        if (typeof opts.settle === "function") opts.settle();
+        return (
+          opts.settle ??
+          new Response(JSON.stringify({ success: true, transaction: "1220u" }), { status: 200 })
+        );
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof globalThis.fetch;
+
+  it("a bodyless 504 on /settle reaches the do-NOT-pay-again guard", async () => {
+    // The gateway timeout the shipped Caddy returns when a settle outruns its
+    // upstream read timeout — while the ExecuteSubmission may be committing.
+    // `r.json()` used to run first, throw on the empty body, and answer
+    // "facilitator unreachable": a definite claim that nothing was submitted.
+    const app = buildApp({
+      facilitatorFetch: facilitator({ settle: new Response(null, { status: 504 }) }),
+    });
+    const res = await request(app).get("/api/data").set(paid);
+    expect(res.status).toBe(502);
+    expect(res.body.error).toMatch(/do NOT pay again/i);
+    expect(res.body.error).not.toMatch(/unreachable/i);
+  });
+
+  it("an HTML 502 on /settle reaches it too", async () => {
+    const app = buildApp({
+      facilitatorFetch: facilitator({
+        settle: new Response("<html>bad gateway</html>", {
+          status: 502,
+          headers: { "content-type": "text/html" },
+        }),
+      }),
+    });
+    const res = await request(app).get("/api/data").set(paid);
+    expect(res.status).toBe(502);
+    expect(res.body.error).toMatch(/do NOT pay again/i);
+  });
+
+  it("a THROW on /settle is ambiguous too, never 'unreachable'", async () => {
+    // A fetch rejection covers a connect failure AND a read timeout after the
+    // request was delivered. Only the second matters, and it is the one where
+    // the payment may already have settled.
+    const app = buildApp({
+      facilitatorFetch: facilitator({
+        settle: () => {
+          throw new Error("UND_ERR_HEADERS_TIMEOUT");
+        },
+      }),
+    });
+    const res = await request(app).get("/api/data").set(paid);
+    expect(res.status).toBe(502);
+    expect(res.body.error).toMatch(/do NOT pay again/i);
+  });
+
+  it("a CONNECT failure says the request never left — it is not ambiguous", async () => {
+    // The other half of the same rule. A connection that was never established
+    // proves no /settle exists, so nothing can have been submitted; telling the
+    // payer "may already have settled — check the receipt" turns an ordinary
+    // outage (facilitator redeploy, wrong URL, dead bridge) into per-payer
+    // manual reconciliation of a payment that was never sent.
+    const app = buildApp({
+      facilitatorFetch: facilitator({
+        settle: () => {
+          throw Object.assign(new TypeError("fetch failed"), {
+            cause: Object.assign(new Error("connect ECONNREFUSED"), {
+              code: "ECONNREFUSED",
+            }),
+          });
+        },
+      }),
+    });
+    const res = await request(app).get("/api/data").set(paid);
+    expect(res.status).toBe(502);
+    expect(res.body.error).toMatch(/never left this server/i);
+    expect(res.body.error).toMatch(/nothing was settled/i);
+    expect(res.body.error).not.toMatch(/do NOT pay again/i);
+  });
+
+  it("an ABORT is still ambiguous — the deadline can fire after delivery", async () => {
+    // DISCRIMINATOR: the split must not leak the other way. An abort proves
+    // nothing about whether the request arrived.
+    const app = buildApp({
+      facilitatorFetch: facilitator({
+        settle: () => {
+          throw Object.assign(new Error("aborted"), { name: "AbortError" });
+        },
+      }),
+    });
+    const res = await request(app).get("/api/data").set(paid);
+    expect(res.status).toBe(502);
+    expect(res.body.error).toMatch(/do NOT pay again/i);
+  });
+
+  it("a 429 on /verify is not a refused payment", async () => {
+    // `isValid` was simply absent on the error body, which is falsy, so the
+    // payer was told its payment was invalid — and a paying client answers 402
+    // by minting a brand-new signed transfer. The merchant's own overload
+    // became churn on the payer's holdings.
+    const app = buildApp({
+      facilitatorFetch: facilitator({
+        verify: new Response(JSON.stringify({ error: "rate_limited" }), { status: 429 }),
+      }),
+    });
+    const res = await request(app).get("/api/data").set(paid);
+    expect(res.status).toBe(502);
+    expect(res.body.error).toMatch(/could not verify/i);
+  });
+
+  it("a non-2xx /settle body is never parsed at all", async () => {
+    // Pins the ORDER, not just the outcome. Both branches now answer the same
+    // sentence, so reordering is invisible from the response alone — but the
+    // ordering is what keeps the guard reachable if the catch is ever narrowed
+    // (say, to tell a connect-refused from a read timeout). Assert the property
+    // directly: on a non-2xx we decide from the status and never touch the body.
+    const gateway = new Response("<html>bad gateway</html>", {
+      status: 504,
+      headers: { "content-type": "text/html" },
+    });
+    const jsonSpy = vi.fn(async () => {
+      throw new Error("body parsed on a non-2xx");
+    });
+    Object.defineProperty(gateway, "json", { value: jsonSpy });
+    const app = buildApp({ facilitatorFetch: facilitator({ settle: gateway }) });
+    const res = await request(app).get("/api/data").set(paid);
+    expect(res.status).toBe(502);
+    expect(res.body.error).toMatch(/do NOT pay again/i);
+    expect(jsonSpy).not.toHaveBeenCalled();
+  });
+
+  it("a genuine isValid:false is STILL a 402 — the refusal must survive", async () => {
+    // DISCRIMINATOR: an actual verdict from the facilitator must keep reaching
+    // the payer as a payment problem, or a real rejection would look like an
+    // outage and never get fixed.
+    const app = buildApp({
+      facilitatorFetch: facilitator({
+        verify: new Response(
+          JSON.stringify({ isValid: false, invalidReason: "invalid_exact_canton_amount" }),
+          { status: 200 }
+        ),
+      }),
+    });
+    const res = await request(app).get("/api/data").set(paid);
+    expect(res.status).toBe(402);
+  });
+
+  it("the happy path still delivers", async () => {
+    // DISCRIMINATOR: a 200 with a clean body must not be caught by any of this.
+    const app = buildApp({ facilitatorFetch: facilitator({}) });
+    const res = await request(app).get("/api/data").set(paid);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ data: "premium-payload" });
+  });
+});
+
+/**
+ * The gate has to key on the path the ROUTER will match, which is the pathname
+ * of `req.originalUrl` — the form every configured key in the README, the docs
+ * and the examples is written in, and the form the 402 body already reports.
+ * It used to key on `req.path`, which Express strips of the mount prefix.
+ */
+describe("the gate covers the path the router serves, mounted or not", () => {
+  const mountedApp = (mount?: string) => {
+    const mw = cantonPaymentMiddleware({
+      routes: { "GET /api/data": { accepts: [requirements()] } },
+      facilitatorUrl: FACILITATOR,
+      fetch: facilitatorMock({ isValid: false, invalidReason: "nope" }, { success: false }),
+    });
+    const app = express();
+    if (mount) app.use(mount, mw);
+    else app.use(mw);
+    app.get("/api/data", (_q, res) => res.json({ data: "premium-payload" }));
+    return app;
+  };
+
+  it("gates the paid route when the middleware is mounted on a sub-path", async () => {
+    // The whole defect: this returned 200 with the premium body and no 402 at
+    // all — silent, unlogged, free forever.
+    const r = await request(mountedApp("/api")).get("/api/data");
+    expect(r.status).toBe(402);
+    expect(r.body).not.toHaveProperty("data");
+  });
+
+  it("still gates it at the app root", async () => {
+    const r = await request(mountedApp()).get("/api/data");
+    expect(r.status).toBe(402);
+  });
+
+  it("gates a MOUNT-RELATIVE route key too", async () => {
+    // The other half of the same hole, and the regression the first fix
+    // introduced: a merchant who wrote the key relative to the mount was gated
+    // before that fix and served free after it. Both spellings must gate.
+    const app = express();
+    app.use(
+      "/api",
+      cantonPaymentMiddleware({
+        routes: { "GET /data": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch: facilitatorMock({ isValid: false, invalidReason: "nope" }, { success: false }),
+      })
+    );
+    app.get("/api/data", (_q, res) => res.json({ data: "premium-payload" }));
+    const r = await request(app).get("/api/data");
+    expect(r.status).toBe(402);
+    expect(r.body).not.toHaveProperty("data");
+  });
+
+  it("still lets an unconfigured path through when mounted", async () => {
+    // The discriminator against over-correcting: concatenating baseUrl must not
+    // start matching routes that were never configured.
+    const app = mountedApp("/api");
+    app.get("/api/free", (_q, res) => res.json({ free: true }));
+    const r = await request(app).get("/api/free");
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({ free: true });
+  });
+});
+
+/**
+ * A settle updateId is global, so the ticket that spends it must be too. Each
+ * middleware instance used to build its own default store, which made one
+ * payment worth one delivery per instance.
+ */
+describe("the default redeemed store is shared across middleware instances", () => {
+  it("refuses the replay at a route gated by a DIFFERENT instance", async () => {
+    // The facilitator answers a repeat /settle of the same bytes from its
+    // idempotency record — same updateId, success:true — so instance #2 sees a
+    // ticket that looks perfectly fresh unless the store is shared.
+    const fac = () =>
+      facilitatorMock({ isValid: true, payer: PAYER }, { success: true, transaction: "update-ONE", payer: PAYER });
+    const app = express();
+    app.use(
+      cantonPaymentMiddleware({
+        routes: { "GET /api/a": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch: fac(),
+      })
+    );
+    app.use(
+      cantonPaymentMiddleware({
+        routes: { "GET /api/b": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch: fac(),
+      })
+    );
+    app.get("/api/a", (_q, res) => res.json({ data: "A" }));
+    app.get("/api/b", (_q, res) => res.json({ data: "B" }));
+
+    const sig = paymentSignature();
+    const a = await request(app).get("/api/a").set("PAYMENT-SIGNATURE", sig);
+    expect(a.status).toBe(200);
+
+    const b = await request(app).get("/api/b").set("PAYMENT-SIGNATURE", sig);
+    expect(b.status).toBe(402);
+    expect(b.body).not.toHaveProperty("data");
+  });
+
+  it("an explicitly passed store still wins over the shared default", async () => {
+    // The discriminator: sharing must not override a merchant's own store.
+    const seen: string[] = [];
+    const app = express();
+    app.use(
+      cantonPaymentMiddleware({
+        routes: { "GET /api/data": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch: facilitatorMock(
+          { isValid: true, payer: PAYER },
+          { success: true, transaction: "update-TWO", payer: PAYER }
+        ),
+        redeemed: {
+          claim: async (id: string) => {
+            seen.push(id);
+            return true;
+          },
+        },
+      })
+    );
+    app.get("/api/data", (_q, res) => res.json({ data: "premium" }));
+    const r = await request(app).get("/api/data").set("PAYMENT-SIGNATURE", paymentSignature());
+    expect(r.status).toBe(200);
+    expect(seen).toEqual(["update-TWO"]);
+  });
+});
+
+/**
+ * The dedup ticket is the settle updateId. `?? ""` used to turn a missing one
+ * into a key EVERY payment shares: the first claimed it, and every later
+ * payment was refused after settling on-ledger — paid, undelivered, told to pay
+ * again, permanently. `facilitatorUrl` is merchant-configured and x402 has the
+ * server pick the facilitator, so this middleware may not assume the remote
+ * fills the field.
+ */
+describe("a settle with no transaction id is not deliverable", () => {
+  const appWith = (settle: { success: boolean; transaction?: string }) => {
+    const app = express();
+    app.use(
+      cantonPaymentMiddleware({
+        routes: { "GET /api/data": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch: facilitatorMock({ isValid: true, payer: PAYER }, settle),
+        // A fresh store per app, so these cases cannot borrow the shared one.
+        redeemed: (() => {
+          const seen = new Set<string>();
+          return { claim: async (id: string) => (seen.has(id) ? false : (seen.add(id), true)) };
+        })(),
+      })
+    );
+    app.get("/api/data", (_q, res) => res.json({ data: "premium" }));
+    return app;
+  };
+
+  it("refuses to deliver, and says the payment may have settled", async () => {
+    const r = await request(appWith({ success: true })).get("/api/data").set("PAYMENT-SIGNATURE", paymentSignature());
+    expect(r.status).toBe(502);
+    expect(r.body).not.toHaveProperty("data");
+    expect(r.body.error).toMatch(/do NOT pay again/);
+  });
+
+  it("treats an empty-string transaction the same way", async () => {
+    const r = await request(appWith({ success: true, transaction: "" }))
+      .get("/api/data")
+      .set("PAYMENT-SIGNATURE", paymentSignature());
+    expect(r.status).toBe(502);
+  });
+
+  it("still delivers on a conforming settle", async () => {
+    // The discriminator against over-correcting: a normal settle must be
+    // untouched by this guard.
+    const r = await request(appWith({ success: true, transaction: "update-OK" }))
+      .get("/api/data")
+      .set("PAYMENT-SIGNATURE", paymentSignature());
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({ data: "premium" });
+  });
+})
+
+describe("a payment that bought nothing gets its ticket back", () => {
+  // This is the arm the sibling fix missed. next/src/index.ts releases the
+  // redemption ticket when the handler throws; express claimed it before
+  // next() and released it nowhere, so a merchant bug turned into a permanently
+  // spent payment: paid on-ledger, nothing delivered, and every retry of the
+  // same signed bytes answered `payment_already_redeemed`.
+  const ticketOf = (u: string) => u;
+
+  function appWithHandler(
+    handler: express.RequestHandler,
+    redeemed: ReturnType<typeof createInMemoryRedeemedStore>
+  ) {
+    const fetch = facilitatorMock(
+      { isValid: true, payer: PAYER },
+      { success: true, transaction: "u-release", payer: PAYER }
+    );
+    const app = express();
+    app.use(
+      cantonPaymentMiddleware({
+        routes: { "GET /api/data": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch,
+        redeemed,
+      })
+    );
+    app.get("/api/data", handler);
+    return app;
+  }
+
+  it("a handler that THROWS releases the ticket, so the payer can be served", async () => {
+    const redeemed = createInMemoryRedeemedStore();
+    const app = appWithHandler(() => {
+      throw new Error("merchant handler blew up");
+    }, redeemed);
+    const res = await request(app).get("/api/data").set(HEADER_PAYMENT_SIGNATURE_V2, paymentSignature());
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    // The observable consequence, not the internal state: a SECOND request with
+    // the same payment is no longer refused as already-redeemed.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(await redeemed.claim(ticketOf("u-release"))).toBe(true);
+  });
+
+  it("but a handler that ANSWERS keeps the ticket spent — one payment, one delivery", async () => {
+    // The discriminator against over-correcting into "always release", which
+    // would make a single payment buy the resource forever.
+    const redeemed = createInMemoryRedeemedStore();
+    const app = appWithHandler((_req, res) => {
+      res.json({ ok: true });
+    }, redeemed);
+    const res = await request(app).get("/api/data").set(HEADER_PAYMENT_SIGNATURE_V2, paymentSignature());
+    expect(res.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(await redeemed.claim(ticketOf("u-release"))).toBe(false);
+  });
+
+  it("a 404 from the ROUTER releases it — we charged for a path nothing serves", async () => {
+    // The other half of the 404 story, and the one that costs money. If the
+    // gate matches a spelling the app's router will not serve, the payer pays,
+    // receives a 404, and under a naive "anything sent counts as delivered"
+    // rule their payment is spent on nothing.
+    const redeemed = createInMemoryRedeemedStore();
+    const fetch = facilitatorMock(
+      { isValid: true, payer: PAYER },
+      { success: true, transaction: "u-release", payer: PAYER }
+    );
+    const app = express();
+    app.use(
+      cantonPaymentMiddleware({
+        routes: { "GET /api/data": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch,
+        redeemed,
+      })
+    );
+    // Deliberately NO handler for /api/data — the gate charges, the router 404s.
+    const res = await request(app)
+      .get("/api/data")
+      .set(HEADER_PAYMENT_SIGNATURE_V2, paymentSignature());
+    expect(res.status).toBe(404);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(await redeemed.claim("u-release")).toBe(true);
+  });
+
+  it("a deliberate 4xx from the handler also keeps it — the merchant answered", async () => {
+    const redeemed = createInMemoryRedeemedStore();
+    const app = appWithHandler((_req, res) => {
+      res.status(404).json({ error: "no such record" });
+    }, redeemed);
+    const res = await request(app).get("/api/data").set(HEADER_PAYMENT_SIGNATURE_V2, paymentSignature());
+    expect(res.status).toBe(404);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(await redeemed.claim(ticketOf("u-release"))).toBe(false);
+  });
+});
+
+describe("the collision guard refuses a real conflict, not a harmless duplicate", () => {
+  const cfg = { accepts: [requirements()] };
+
+  it("two spellings of one route sharing ONE config are allowed to boot", () => {
+    // The 0.2.2 workaround for the trailing-slash hole was to configure both
+    // spellings. This version closes the hole, so the duplicate is redundant —
+    // but a patch bump must not stop the merchant's server from starting over
+    // a config that was correct and is now merely unnecessary.
+    expect(() =>
+      cantonPaymentMiddleware({
+        routes: { "GET /api/data": cfg, "GET /api/data/": cfg },
+        facilitatorUrl: FACILITATOR,
+      })
+    ).not.toThrow();
+  });
+
+  it("but two spellings with DIFFERENT configs still refuse to start", () => {
+    // The discriminator: here the index really can only keep one, so serving
+    // would charge one spelling at the other's price. Loud beats silent.
+    expect(() =>
+      cantonPaymentMiddleware({
+        routes: {
+          "GET /api/data": { accepts: [requirements()] },
+          "GET /api/data/": { accepts: [requirements()], description: "other" },
+        },
+        facilitatorUrl: FACILITATOR,
+      })
+    ).toThrow(/same route to express/);
   });
 });

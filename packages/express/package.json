@@ -1,17 +1,17 @@
 {
   "name": "@ftptech/x402-canton-express",
-  "version": "0.2.1",
+  "version": "0.2.6",
   "description": "Express middleware to gate routes behind Canton x402 payment via a facilitator.",
   "license": "Apache-2.0",
   "author": "FTP team",
-  "homepage": "https://github.com/sunstrike228/canton-x402-merchant#readme",
+  "homepage": "https://github.com/sunstrike228/canton-x402/tree/main/packages/express#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sunstrike228/canton-x402-merchant.git",
+    "url": "git+https://github.com/sunstrike228/canton-x402.git",
     "directory": "packages/express"
   },
   "bugs": {
-    "url": "https://github.com/sunstrike228/canton-x402-merchant/issues"
+    "url": "https://github.com/sunstrike228/canton-x402/issues"
   },
   "keywords": [
     "x402",
@@ -44,7 +44,7 @@
     "lint": "eslint src --max-warnings 0"
   },
   "dependencies": {
-    "@ftptech/x402-canton-core": "^0.6.0"
+    "@ftptech/x402-canton-core": "^1.2.0"
   },
   "peerDependencies": {
     "express": "^4.0.0 || ^5.0.0"
