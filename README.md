@@ -1,38 +1,32 @@
-# canton-x402-merchant
+# x402-canton-merchant
 
-Resource-server middleware for the Canton x402 stack. Gate HTTP routes
-behind a Canton payment that is verified and settled through an x402
-facilitator, for Express and for the Next.js App Router.
+Charge per HTTP request in Canton Coin or a CIP-56 token. Middleware for Express and the Next.js App Router; FTP's facilitator settles the payments.
 
-## Packages
+| Package | Install |
+| --- | --- |
+| [`@ftptech/x402-canton-express`](packages/express/README.md) | `npm i @ftptech/x402-canton-express` |
+| [`@ftptech/x402-canton-next`](packages/next/README.md) | `npm i @ftptech/x402-canton-next` |
 
-| Package | npm | Purpose |
-| --- | --- | --- |
-| `@ftptech/x402-canton-express` | [npm](https://www.npmjs.com/package/@ftptech/x402-canton-express) | Express middleware to gate routes behind Canton x402 payment via a facilitator. |
-| `@ftptech/x402-canton-next` | [npm](https://www.npmjs.com/package/@ftptech/x402-canton-next) | Next.js App Router wrapper to gate Route Handlers behind Canton x402 payment via a facilitator. |
+## Quickstart
 
-See each package README for usage:
-[`packages/express`](packages/express/README.md),
-[`packages/next`](packages/next/README.md).
+1. Create a wallet and turn on receiving:
+   ```bash
+   npx @ftptech/canton-agent-wallet create --relay-url https://facilitator.ftptech.xyz
+   npx @ftptech/canton-agent-wallet address       # your party id: payTo
+   # send a few CC to it, then
+   npx @ftptech/canton-agent-wallet claim
+   npx @ftptech/canton-agent-wallet preapproval
+   ```
+2. Gate a route: copy the example from the [Express](packages/express/README.md#example) or [Next.js](packages/next/README.md#example) README and set `payTo` and `amount`.
 
-## Install
+Full guide: [x402-docs.ftptech.xyz/x402-merchant](https://x402-docs.ftptech.xyz/x402-merchant).
 
-```bash
-# Express
-npm i @ftptech/x402-canton-express
+## Related
 
-# Next.js
-npm i @ftptech/x402-canton-next
-```
-
-Both depend on `@ftptech/x402-canton-core` from
-[canton-x402-core](https://github.com/sunstrike228/canton-x402-core).
-
-## Part of the canton-x402 suite
-
-- [canton-x402-core](https://github.com/sunstrike228/canton-x402-core): shared types + ledger primitives.
-- [canton-x402-merchant](https://github.com/sunstrike228/canton-x402-merchant) (this repo): Express and Next.js middleware to gate routes behind payment.
-- [canton-x402-agent](https://github.com/sunstrike228/canton-x402-agent): payer-side client SDK, agent wallet CLI, and MCP server.
+- [x402-canton-agent](https://github.com/FTP-Tech-LLC/x402-canton-agent): pay x402 endpoints (CLI, SDK, MCP)
+- [x402-canton-core](https://github.com/FTP-Tech-LLC/x402-canton-core): shared types and ledger client
+- [x402-canton-facilitator](https://github.com/FTP-Tech-LLC/x402-canton-facilitator): the facilitator
+- [Spec](https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_canton.md)
 
 ## License
 
