@@ -27,8 +27,8 @@ importers:
   packages/express:
     dependencies:
       '@ftptech/x402-canton-core':
-        specifier: ^1.2.0
-        version: 1.2.0
+        specifier: ^1.4.0
+        version: 1.4.0
     devDependencies:
       '@types/express':
         specifier: ^5.0.0
@@ -46,8 +46,8 @@ importers:
   packages/next:
     dependencies:
       '@ftptech/x402-canton-core':
-        specifier: ^1.2.0
-        version: 1.2.0
+        specifier: ^1.4.0
+        version: 1.4.0
 
 packages:
 
@@ -227,8 +227,8 @@ packages:
     resolution: {integrity: sha512-43/qtrDUokr7LJqoF2c3+RInu/t4zfrpYdoSDfYyhg52rwLV6TnOvdG4fXm7IkSB3wErkcmJS9iEhjVtOSEjjA==}
     engines: {node: ^18.18.0 || ^20.9.0 || >=21.1.0}
 
-  '@ftptech/x402-canton-core@1.2.0':
-    resolution: {integrity: sha512-bx1YbNR13OEGGkzVcioQsGif41BhZwzoZ8TUyI5FNzOhIfoO/6VFdM49yHTfZQV7fTBbOLsAGGQQwfI2/qbq9w==}
+  '@ftptech/x402-canton-core@1.4.0':
+    resolution: {integrity: sha512-gRad3we8Gfx0WYGM5IJgcC9WfJ9yoNBgCFcpfvQDosUyIUty8wc7JeMIaTHV6h9wI9tfOGqUQ5HEREix/xgQ0Q==}
 
   '@humanfs/core@0.19.2':
     resolution: {integrity: sha512-UhXNm+CFMWcbChXywFwkmhqjs3PRCmcSa/hfBgLIb7oQ5HNb1wS0icWsGtSAUNgefHeI+eBrA8I1fxmbHsGdvA==}
@@ -1455,7 +1455,7 @@ snapshots:
       '@eslint/core': 0.17.0
       levn: 0.4.1
 
-  '@ftptech/x402-canton-core@1.2.0': {}
+  '@ftptech/x402-canton-core@1.4.0': {}
 
   '@humanfs/core@0.19.2':
     dependencies:

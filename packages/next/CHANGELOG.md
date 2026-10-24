@@ -36,6 +36,14 @@
 - Updated dependencies [6428700]
   - @ftptech/x402-canton-core@1.0.0
 
+## 0.2.4
+
+### Patch Changes
+
+- Dependency range only.
+- Updated dependencies
+  - @ftptech/x402-canton-core@0.8.0
+
 ## 0.2.3
 
 ### Patch Changes
