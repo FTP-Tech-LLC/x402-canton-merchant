@@ -97,8 +97,9 @@ interface PaymentPayloadEnvelope {
  * INSTANCE: replay the identical PAYMENT-SIGNATURE header against a route
  * gated by another instance and it served, because the facilitator answers a
  * repeat /settle of the same bytes from its idempotency record with the
- * ORIGINAL updateId and `success:true`, so instance #2 sees a fresh, valid
- * ticket its own Map has never held.
+ * ORIGINAL updateId (as `success:true`, or under the scheme's answer as a
+ * refusal this middleware reads the same way), so instance #2 sees a fresh,
+ * valid ticket its own Map has never held.
  *
  * The ticket has to be global, because the thing it identifies — a settle
  * updateId — is global. packages/next reached this conclusion first (see
@@ -109,6 +110,21 @@ interface PaymentPayloadEnvelope {
  * even for a single process.
  */
 let processRedeemed: RedeemedStore | undefined;
+
+/** Waits before each retry of a `settlement_pending` settle: about 7 s in all. */
+const PENDING_RETRY_MS = [1000, 2000, 4000];
+
+/** The body of a 503 /settle when it is the scheme's `settlement_pending`
+ *  answer, else null (a proxy error page, or a facilitator that cannot tell). */
+async function pendingBody(r: globalThis.Response): Promise<Record<string, unknown> | null> {
+  const body = (await r.json().catch(() => null)) as Record<string, unknown> | null;
+  return body !== null &&
+    typeof body === "object" &&
+    body.success === false &&
+    body.errorReason === "settlement_pending"
+    ? body
+    : null;
+}
 
 export function cantonPaymentMiddleware(
   options: CantonPaymentMiddlewareOptions
@@ -127,6 +143,31 @@ export function cantonPaymentMiddleware(
   // CIP-56 path). Fail fast at setup.
   for (const route of Object.values(options.routes)) {
     for (const r of route.accepts) assertAssetInstrumentConsistency(r);
+  }
+
+  // A ROUTE KEY IS A METHOD AND A LITERAL PATH.
+  //
+  // Keys are looked up as written. "GET /api/items/:id", "GET /premium/*",
+  // "GET /docs/[slug]", a key with a query or a space, or one with no method
+  // (the shapes @x402/express takes as patterns) matched no request here, so
+  // the middleware called next() and the handler served the paid response
+  // free, with no error at startup. Brackets inside a name ("report[1].pdf")
+  // are a literal path; a whole [slug] / [...slug] / [[...slug]] segment is not.
+  for (const key of Object.keys(options.routes)) {
+    const sp = key.indexOf(" ");
+    const method = sp < 0 ? "" : key.slice(0, sp);
+    const path = sp < 0 ? key : key.slice(sp + 1);
+    if (
+      !/^[A-Za-z]+$/.test(method) ||
+      !path.startsWith("/") ||
+      /[?#*\s]|(^|\/):|(^|\/)\[{1,2}(\.\.\.)?[^/\]]+\]{1,2}(?=\/|$)/.test(path)
+    ) {
+      throw new Error(
+        `cantonPaymentMiddleware: route ${JSON.stringify(key)} is not "METHOD /literal/path". ` +
+          `Keys are literal: ":param", "*", "[slug]", a query or a space match no ` +
+          `request, so the paid route would be served free. Give each paid path its own key.`
+      );
+    }
   }
 
   // THE GATE MUST COVER EVERYTHING THE ROUTER WILL SERVE.
@@ -209,33 +250,61 @@ export function cantonPaymentMiddleware(
   let cachedMode = "";
   // The loosest reading, always available. See the note in the handler.
   const looseIndex = buildIndex(false, false);
+  // Every key by the path express.static reads for it (canonicalPath), read
+  // loosely, and apart those whose written form is not canonical (written
+  // with escapes). See "A PAID FILE IS NOT FREE" in the handler.
+  const canonIndex = new Map<string, RouteConfig>();
+  const escapedKeyIndex = new Map<string, RouteConfig>();
+  {
+    const firstKey = new Map<string, string>();
+    for (const [key, cfg] of Object.entries(options.routes)) {
+      const sp = key.indexOf(" ");
+      const method = (sp < 0 ? key : key.slice(0, sp)).toUpperCase();
+      const path = sp < 0 ? "" : key.slice(sp + 1);
+      if (!path.startsWith("/")) continue;
+      const canon = canonicalPath(path) ?? path;
+      const k = `${method} ${norm(canon, false, false)}`;
+      const prev = firstKey.get(k);
+      if (prev !== undefined && options.routes[prev] !== cfg) {
+        throw new Error(
+          `cantonPaymentMiddleware: routes ${JSON.stringify(prev)} and ` +
+            `${JSON.stringify(key)} are one file to express.static (it decodes ` +
+            `%XX and resolves "." and "..") — only one could ever be charged. ` +
+            `Give them distinct paths.`
+        );
+      }
+      firstKey.set(k, key);
+      canonIndex.set(k, cfg);
+      if (norm(canon, false, false) !== norm(path, false, false)) escapedKeyIndex.set(k, cfg);
+    }
+  }
 
-  return async function middleware(req, res, next) {
-    // THE APP'S ROUTING FLAGS DO NOT GOVERN A SUB-ROUTER.
+  const handle: RequestHandler = async function middleware(req, res, next) {
+    // THE APP'S ROUTING FLAGS DO NOT GOVERN EVERY ROUTER, SO THE GATE CHARGES
+    // ONLY WHAT THEY MATCH.
     //
     // `strict routing` and `case sensitive routing` configure the app's OWN
-    // base router; an `express.Router()` instance is built by the raw `router`
-    // package with strict:false/caseSensitive:false and never consults the app.
-    // So a merchant who turns strict routing on and puts the paid route on a
-    // Router — the standard way to organise an express app, and the shape the
-    // mount fix above exists to serve — got a sub-router still matching loosely
-    // while this gate had stopped normalising. Measured, paid route on a Router
-    // mounted at /api with `strict routing` ON:
-    //
-    //   GET /api/data/   ->  200 {"data":"premium-payload"}
-    //
-    // The gate cannot know which router will serve the request, so it must not
-    // be stricter than the loosest one that could. Every spelling is therefore
-    // looked up under the app's own normalisation AND under the loosest one.
-    // Matching too much costs a 402 on a path a strict app would have 404'd —
-    // visible, and not a resource given away.
-    const strict = req.app?.get?.("strict routing") === true;
-    const caseSensitive = req.app?.get?.("case sensitive routing") === true;
+    // base router; an `express.Router()` is built loose and never consults the
+    // app. A spelling the flags reject (GET /api/data/ for "GET /api/data" with
+    // strict routing on) may be served by a Router or answered 404 by the app's
+    // own router, and from inside the request the gate cannot tell which.
+    // Passing it on served the paid route free in the first case (measured:
+    // gate on the app, paid route on a Router, 200 premium); charging it took a
+    // payment for a 404 in the second (measured: gate mounted at /api, paid
+    // route on the app, settle and then 404). So such a spelling gets 404
+    // wherever the gate sits, and the spelling the flags accept is charged and
+    // served.
+    // Truthy, as Express reads them (app.enabled): "true" or 1 turns them on.
+    const strict = Boolean(req.app?.get?.("strict routing"));
+    const caseSensitive = Boolean(req.app?.get?.("case sensitive routing"));
     const mode = `${strict}|${caseSensitive}`;
     if (cachedIndex === null || cachedMode !== mode) {
       cachedIndex = buildIndex(strict, caseSensitive);
       cachedMode = mode;
     }
+    // Held for the close listener: by then routing has rewritten req.baseUrl.
+    const appIndex = cachedIndex;
+    const baseUrl = req.baseUrl;
     // ONE REQUEST HAS TWO HONEST SPELLINGS, SO BOTH MUST GATE.
     //
     // Express strips the mount prefix from `req.path`. Mounted at "/api", a
@@ -260,9 +329,9 @@ export function cantonPaymentMiddleware(
     // unpaid delivery, which is neither. The relative spelling can only ever
     // fire for requests already routed through this mount, so it cannot reach
     // across into an unrelated subtree.
-    const method = req.method.toUpperCase();
     const inIndex = (
       index: Map<string, RouteConfig>,
+      method: string,
       p: string
     ): RouteConfig | undefined =>
       index.get(`${method} ${p}`) ??
@@ -271,49 +340,132 @@ export function cantonPaymentMiddleware(
       (method === "HEAD" ? index.get(`GET ${p}`) : undefined);
 
     /**
-     * One raw path, looked up under the app's normalisation and — only when we
-     * are inside a mount — under the loosest one too.
-     *
-     * The mount test is what keeps the loose reading from costing money. This
-     * middleware SETTLES before it calls next(), so a match on a path the
-     * router then refuses is not a spurious 402: it is a payer who paid and got
-     * a 404. Measured, `strict routing` ON and the paid route on the app's own
-     * base router:
-     *
-     *   GET /api/data/  ->  404, and the settle had already happened
-     *
-     * On the app's base router the app's flags DO describe the router that
-     * serves, so matching more than they allow can only ever match something
-     * that will 404. Inside a mount they do not — an express.Router() is built
-     * loose and ignores them — which is the hole the loose reading exists to
-     * close. So it is applied exactly there and nowhere else.
+     * One raw path, looked up under the app's normalisation. This middleware
+     * SETTLES before it calls next(), so a match on a path the router then
+     * refuses is a payer who paid and got a 404; with the flags on, the
+     * loosest index only refuses (looseHit below), it never charges.
      */
-    const lookup = (raw: string): RouteConfig | undefined =>
-      inIndex(cachedIndex!, norm(raw, strict, caseSensitive)) ??
-      (req.baseUrl ? inIndex(looseIndex, norm(raw, false, false)) : undefined);
+    const lookup = (method: string, raw: string): RouteConfig | undefined =>
+      inIndex(appIndex, method, norm(raw, strict, caseSensitive));
 
-    const config =
-      lookup(req.baseUrl + req.path) ??
+    // `path` is relative to this middleware's mount, as `req.path` is, except
+    // that "" is the mount's root without its slash (see relPath below).
+    const gated = (method: string, path: string): RouteConfig | undefined =>
+      lookup(method, baseUrl + path) ??
       // Only worth a second spelling when the middleware is actually mounted.
-      (req.baseUrl ? lookup(req.path) : undefined);
+      (baseUrl ? lookup(method, path || "/") : undefined);
+    const looseGated = (method: string, path: string): RouteConfig | undefined =>
+      inIndex(looseIndex, method, norm(baseUrl + path, false, false)) ??
+      (baseUrl ? inIndex(looseIndex, method, norm(path || "/", false, false)) : undefined);
+
+    const method = req.method.toUpperCase();
+    // Express 4 leaves req.path null for an absolute-form target such as
+    // "GET foo://h/api" once a mount path is cut from it.
+    if (typeof req.path !== "string") {
+      res.status(400).json({ error: "malformed request target" });
+      return;
+    }
+
+    // A PAID PATH SPELLED WITH REPEATED SLASHES IS REFUSED, NOT GUESSED.
+    //
+    // Express 4 drops one slash after a mount path. With this gate on the app
+    // and the paid route on `app.use("/api", router)`, GET /api//data found no
+    // key here and the router served it as /data: the paid route, free. With
+    // this gate mounted at "/api" and the route on the app, the slash was
+    // dropped before the gate saw it, so the gate charged and the app answered
+    // 404. On Express 5 a Router's paid root answered GET /api// free. Whether
+    // a router serves such a path depends on mounts this gate cannot see, so a
+    // paid path with repeated slashes in the URL is neither charged nor passed
+    // on.
+    // Both spellings are checked: the URL as sent (a mount may already have
+    // dropped a slash from req.path) and req.path (Express turns "\" into "/").
+    const rawPath = String(req.originalUrl ?? req.url ?? "")
+      .split(/[?#]/, 1)[0]!
+      .replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/i, "");
+    // At a mount's root Express gives req.path "/" for both /api and /api/;
+    // the URL as sent tells them apart. Read as "/", a paid "GET /api" was
+    // looked up as /api/ and, with strict routing on, refused in every
+    // spelling.
+    const relPath = baseUrl && req.path === "/" && !rawPath.endsWith("/") ? "" : req.path;
+    const config = gated(method, relPath);
+    const collapsed = relPath.replace(/\/{2,}/g, "/");
+    // THE APP'S FLAGS MISS, THE LOOSEST READING HITS: REFUSE, NOT PASS ON.
+    //
+    // With `strict routing` or `case sensitive routing` on the app, this gate on
+    // the app and the paid route on an express.Router(), which ignores those
+    // flags, GET /api/data/ or /API/data found no key here and the router
+    // served the paid route free. The app's own router answers 404 to the same
+    // request; anything else after this gate that answers such a spelling (a
+    // free route, a parameter route, static files, a redirect to the canonical
+    // path) gets 404 now too. The same holds inside a mount: see the note at
+    // the top of the handler.
+    const looseHit = (strict || caseSensitive) && looseGated(method, collapsed) !== undefined;
+    if (
+      (rawPath.includes("//") || collapsed !== relPath) &&
+      (config ?? gated(method, collapsed) ?? looseHit)
+    ) {
+      res.status(400).json({ error: "repeated slashes in the path of a paid route" });
+      return;
+    }
+    // A PAID FILE IS NOT FREE UNDER ANOTHER SPELLING OF ITS PATH.
+    //
+    // express.static decodes percent-escapes and resolves "." and ".." before
+    // it reads the file; the router and this gate compare the path as sent.
+    // With "GET /files/report.pdf" paid and the file under express.static at
+    // /files, GET /files/./report.pdf, /files/x/../report.pdf and
+    // /files/%72eport.pdf found no key here and were served free. A path whose
+    // canonical form is that of a paid key it does not itself match is
+    // refused. It is read loosely: no honest client sends such a path. A path
+    // sent in canonical form is left to the checks above, unless the key it
+    // matches was written with escapes: for "GET /files/a%5B1%5D.pdf",
+    // /files/a[1].pdf is the same file.
+    const canonicalHit = (p: string | null, asSent: string): RouteConfig | undefined => {
+      if (p === null) return undefined;
+      const index = p === asSent ? escapedKeyIndex : canonIndex;
+      return inIndex(index, method, norm(p, false, false));
+    };
+    const canonRel = relPath === "" ? "" : canonicalPath(relPath);
+    const canonConfig =
+      canonicalHit(canonRel === null ? null : baseUrl + canonRel, baseUrl + collapsed) ??
+      (baseUrl ? canonicalHit(canonRel, collapsed) : undefined) ??
+      canonicalHit(canonicalPath(rawPath), rawPath.replace(/\/{2,}/g, "/"));
+    if (canonConfig !== undefined && canonConfig !== config) {
+      res.status(400).json({ error: "non-canonical path for a paid route" });
+      return;
+    }
     if (!config) {
+      if (looseHit) {
+        res.status(404).json({ error: "not found" });
+        return;
+      }
       next();
       return;
     }
 
     const sigHeader = req.header(HEADER_PAYMENT_SIGNATURE_V2);
+    // Every answer this middleware gives on a paid route is per payer: keep it
+    // out of shared caches. The paid response itself gets `private` below,
+    // merged into whatever Cache-Control the app had set before this gate.
+    const appCacheControl = res.getHeader("Cache-Control");
+    res.setHeader("Cache-Control", "no-store");
     if (!sigHeader) {
       respond402WithRequired(req, res, config);
       return;
     }
 
-    let envelope: PaymentPayloadEnvelope;
+    let decoded: unknown;
     try {
-      envelope = decodeBase64Json<PaymentPayloadEnvelope>(sigHeader);
+      decoded = decodeBase64Json<unknown>(sigHeader);
     } catch {
+      decoded = undefined;
+    }
+    // Valid JSON may still be null, an array or a primitive; only an object
+    // is an envelope. Reading `.accepted` of null threw.
+    if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) {
       res.status(400).json({ error: "malformed PAYMENT-SIGNATURE header" });
       return;
     }
+    const envelope = decoded as PaymentPayloadEnvelope;
 
     // SECURITY (SEC-1): the `accepted` block lives inside the
     // client-controlled PAYMENT-SIGNATURE envelope and MUST NOT be trusted
@@ -336,6 +488,20 @@ export function cantonPaymentMiddleware(
       );
       return;
     }
+
+    // THE PAYER MAY LEAVE WHILE WE SETTLE.
+    //
+    // A settle takes seconds, up to 45, and the payer's connection can close in
+    // that time (a proxy timeout, a cancelled tool call). The release listener
+    // below is attached after the claim, so a close that came earlier never
+    // reached it: the ticket stayed spent, the handler wrote to a dead socket,
+    // and a retry of the same payment was refused payment_already_redeemed.
+    // Watched from here: gone before /settle, nothing is settled; gone before
+    // the handler starts, nothing is claimed (or the claim is given back).
+    let clientGone = false;
+    res.once("close", () => {
+      if (!res.writableEnded) clientGone = true;
+    });
 
     // POST /verify
     let verifyJson: { isValid?: boolean; invalidReason?: string };
@@ -375,6 +541,7 @@ export function cantonPaymentMiddleware(
       respond402WithRequired(req, res, config, verifyJson.invalidReason);
       return;
     }
+    if (clientGone) return;
 
     // POST /settle BEFORE running the handler (pre-handler settle).
     let settleJson: {
@@ -385,76 +552,128 @@ export function cantonPaymentMiddleware(
     } & Record<
       string,
       unknown
-    >;
-    try {
-      const r = await fetchImpl(`${facilitatorUrl}/settle`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          x402Version: 2,
-          paymentPayload: envelope,
-          paymentRequirements: requirements,
-        }),
-      });
-      // STATUS FIRST, BODY SECOND. This check used to sit AFTER `r.json()`,
-      // inside the same try — so any non-2xx whose body is not JSON threw, and
-      // control jumped to the catch below. The facilitator itself always
-      // answers JSON, which is why that looked safe in-repo; the bodies that
-      // are not JSON come from the reverse proxy this repo ships in front of it
-      // (ops/*/Caddyfile), which returns a bodyless 502/504 when an upstream
-      // read times out. A settle can spend 45s in the submit, past that
-      // timeout, while the ExecuteSubmission goes on to commit on-ledger.
-      //
-      // So the one branch written to say "do NOT pay again" was exactly the
-      // branch that could not run in the case it was written for.
-      //
-      // A non-2xx /settle is NOT a payment rejection — the facilitator answers
-      // 503 when it cannot tell whether the submission committed. Turning that
-      // into 402 tells the payer "rejected", and the paying client responds to
-      // a 402 by minting a BRAND-NEW signed transfer over the payer's remaining
-      // holdings: a second real payment for one purchase, which no dedup
-      // catches because the commandId and hash are both fresh. Answer a
-      // transport error instead, so the caller retries the SAME envelope.
-      if (!r.ok) {
-        res
-          .status(502)
-          .json({
+    > = {};
+    // A PENDING SETTLE IS RETRIED HERE, WITH THE SAME PAYMENT. The facilitator
+    // answers `settlement_pending` when the participant took the transfer and
+    // its outcome is not known yet; asking again lets it look the submission
+    // up. Answering the payer 402 would read as "rejected" and invite a second
+    // payment while the first can still commit.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const r = await fetchImpl(`${facilitatorUrl}/settle`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            x402Version: 2,
+            paymentPayload: envelope,
+            paymentRequirements: requirements,
+          }),
+        });
+        // STATUS FIRST, BODY SECOND. This check used to sit AFTER `r.json()`,
+        // inside the same try — so any non-2xx whose body is not JSON threw, and
+        // control jumped to the catch below. The facilitator itself always
+        // answers JSON, which is why that looked safe in-repo; the bodies that
+        // are not JSON come from the reverse proxy this repo ships in front of it
+        // (ops/*/Caddyfile), which returns a bodyless 502/504 when an upstream
+        // read times out. A settle can spend 45s in the submit, past that
+        // timeout, while the ExecuteSubmission goes on to commit on-ledger.
+        //
+        // So the one branch written to say "do NOT pay again" was exactly the
+        // branch that could not run in the case it was written for.
+        //
+        // A non-2xx /settle is NOT a payment rejection — the facilitator answers
+        // 503 when it cannot tell whether the submission committed. Turning that
+        // into 402 tells the payer "rejected", and the paying client responds to
+        // a 402 by minting a BRAND-NEW signed transfer over the payer's remaining
+        // holdings: a second real payment for one purchase, which no dedup
+        // catches because the commandId and hash are both fresh. Answer a
+        // transport error instead, so the caller retries the SAME envelope.
+        // The one exception is the scheme's pending answer, which travels as a
+        // 503 with its body so that older middleware lands here; it is retried
+        // below like a 200 one.
+        if (!r.ok) {
+          const pending = r.status === 503 ? await pendingBody(r) : null;
+          if (!pending) {
+            res
+              .status(502)
+              .json({
+                error:
+                  "facilitator could not confirm the payment — do NOT pay again; " +
+                  "retry the same payment or check the merchant's receipt",
+              });
+            return;
+          }
+          settleJson = pending as typeof settleJson;
+        } else {
+          settleJson = (await r.json()) as typeof settleJson;
+        }
+      } catch (err) {
+        // A THROW HERE COVERS TWO DIFFERENT FACTS, and they must not be merged.
+        //
+        // My first pass at this said "we know exactly as much: nothing" and gave
+        // both the ambiguous wording. That was wrong in the safe-looking
+        // direction: a connection that was never established PROVES the request
+        // never left this process, so no /settle exists and nothing can have been
+        // submitted. Reporting that as "may already have settled" turns an
+        // ordinary outage — a facilitator redeploy, a wrong URL, a dead bridge —
+        // into per-payer manual reconciliation of a payment that was never sent.
+        //
+        // Anything else — a reset, a read timeout, an abort — happened with a
+        // socket open and the request possibly delivered. That one is genuinely
+        // unknown and keeps the do-NOT-pay-again wording. `connectionNeverEstablished`
+        // only ever makes the safe claim: unrecognised failures fall through here.
+        if (connectionNeverEstablished(err)) {
+          res.status(502).json({
             error:
-              "facilitator could not confirm the payment — do NOT pay again; " +
-              "retry the same payment or check the merchant's receipt",
+              "facilitator unreachable on /settle — the request never left this " +
+              "server, so nothing was settled; retry the same payment",
           });
-        return;
-      }
-      settleJson = (await r.json()) as typeof settleJson;
-    } catch (err) {
-      // A THROW HERE COVERS TWO DIFFERENT FACTS, and they must not be merged.
-      //
-      // My first pass at this said "we know exactly as much: nothing" and gave
-      // both the ambiguous wording. That was wrong in the safe-looking
-      // direction: a connection that was never established PROVES the request
-      // never left this process, so no /settle exists and nothing can have been
-      // submitted. Reporting that as "may already have settled" turns an
-      // ordinary outage — a facilitator redeploy, a wrong URL, a dead bridge —
-      // into per-payer manual reconciliation of a payment that was never sent.
-      //
-      // Anything else — a reset, a read timeout, an abort — happened with a
-      // socket open and the request possibly delivered. That one is genuinely
-      // unknown and keeps the do-NOT-pay-again wording. `connectionNeverEstablished`
-      // only ever makes the safe claim: unrecognised failures fall through here.
-      if (connectionNeverEstablished(err)) {
+          return;
+        }
         res.status(502).json({
           error:
-            "facilitator unreachable on /settle — the request never left this " +
-            "server, so nothing was settled; retry the same payment",
+            "facilitator could not confirm the payment — do NOT pay again; " +
+            "retry the same payment or check the merchant's receipt",
         });
         return;
       }
+      if (settleJson.errorReason === "settlement_pending" && attempt < PENDING_RETRY_MS.length) {
+        await new Promise((r) => setTimeout(r, PENDING_RETRY_MS[attempt]));
+        if (clientGone) return;
+        continue;
+      }
+      break;
+    }
+    if (settleJson.errorReason === "settlement_pending") {
       res.status(502).json({
         error:
-          "facilitator could not confirm the payment — do NOT pay again; " +
-          "retry the same payment or check the merchant's receipt",
+          "the payment is pending on the ledger — do NOT pay again; retry the " +
+          "same payment shortly",
       });
       return;
+    }
+
+    // A REPEAT OF A SETTLED PAYMENT. A facilitator that follows the scheme does
+    // not answer it with success: it refuses with the updateId, so a server
+    // that keeps no record of its own cannot serve one payment many times.
+    // This middleware does keep one: the updateId is the payment's ticket, and
+    // the claim below serves it once, or again only after a delivery that
+    // failed gave the ticket back. Without a store there is nothing to decide
+    // with, and it stays a refusal.
+    const alreadySettled =
+      settleJson.success !== true &&
+      settleJson.errorReason === "invalid_exact_canton_payment_already_settled" &&
+      typeof settleJson.transaction === "string" &&
+      settleJson.transaction.length > 0 &&
+      redeemed !== null;
+    if (alreadySettled) {
+      const { transaction, network, payer } = settleJson;
+      settleJson = {
+        success: true,
+        transaction: transaction as string,
+        ...(network !== undefined ? { network } : {}),
+        ...(payer !== undefined ? { payer } : {}),
+      };
     }
 
     // Positive confirmation only (SEC-1 / M1): a missing or non-`true`
@@ -463,6 +682,9 @@ export function cantonPaymentMiddleware(
       res.status(402).json({ error: settleJson.errorReason ?? "settle failed" });
       return;
     }
+    // Settled, but nobody is there to serve: claim nothing, so a retry of the
+    // same payment is still served.
+    if (clientGone) return;
 
     // ONE PAYMENT, ONE DELIVERY. `settleJson.transaction` is the settle
     // updateId; the facilitator returns the SAME one for every replay of the
@@ -498,6 +720,12 @@ export function cantonPaymentMiddleware(
         respond402WithRequired(req, res, config, "payment_already_redeemed");
         return;
       }
+      if (clientGone) {
+        void Promise.resolve(redeemed.release?.(ticket)).catch(() => {
+          /* the payer left before the handler started; nothing to keep */
+        });
+        return;
+      }
 
       // GIVE THE TICKET BACK WHEN NOTHING WAS DELIVERED.
       //
@@ -517,13 +745,20 @@ export function cantonPaymentMiddleware(
       // Express cannot wrap `next()` the same way, because the handler runs
       // after this function returns. The observable equivalent is the response
       // itself: `close` fires exactly once, on every path including a socket
-      // that died mid-write. Two conditions mean "not delivered":
-      //   * nothing was ever sent (`!res.headersSent`) — the handler threw
-      //     before writing, or the connection dropped;
-      //   * a 5xx went out — which is what express's own error handler sends
-      //     when a handler throws, i.e. the precise case next's catch covers.
-      // A 2xx, a 3xx, and a 4xx the handler chose deliberately all keep the
-      // ticket claimed: the merchant answered, and re-delivery is not owed.
+      // that died mid-write. "Not delivered" is a 5xx (what express's own error
+      // handler sends when a handler throws, the case next's catch covers) or a
+      // request the router did not serve (below). A 2xx, a 3xx, and a 4xx the
+      // handler chose deliberately all keep the ticket claimed: the merchant
+      // answered, and re-delivery is not owed.
+      //
+      // A connection that drops after the handler started, before any header
+      // went out (the payer's client or a proxy timing out on a slow handler),
+      // gives the ticket back ONCE per payment. It used to come back every
+      // time, and node does not stop a handler when its client leaves: re-sending
+      // the same header and closing early ran the handler again for one payment,
+      // as often as the facilitator answered the repeat. Never giving it back
+      // cost an honest payer behind a 60 s proxy timeout the whole payment. One
+      // return bounds a payment to two runs of the handler and keeps that retry.
       //
       // A release that itself fails must not become the visible failure — the
       // payer is no worse off than before this existed, same rule as next.
@@ -544,9 +779,25 @@ export function cantonPaymentMiddleware(
           // Without it the second case reads as delivery and the payment is
           // spent on nothing — which is exactly the hole the loose route index
           // can open when it charges for a path the router then declines.
-          const answered = req.route !== undefined;
-          const delivered = res.headersSent && res.statusCode < 500 && answered;
-          if (delivered) return;
+          //
+          // So a 404 from middleware (`req.route` unset) returns the ticket, and
+          // so does a middleware redirect that fetch follows back through this
+          // gate, where the followed request claims it or, with the routing
+          // flags on, is refused (express.static's redirect from /files/docs to
+          // /files/docs/). Any other 3xx, and a route handler's, keeps it spent:
+          // a redirect elsewhere may be the delivery itself (a signed download
+          // URL).
+          const followed = followedRequest(res, method, req.originalUrl, baseUrl);
+          const notServed =
+            req.route === undefined &&
+            (res.statusCode === 404 ||
+              (followed !== undefined &&
+                (gated(followed.method, followed.path) !== undefined ||
+                  ((strict || caseSensitive) && looseGated(followed.method, followed.path) !== undefined))));
+          const notDelivered = res.headersSent
+            ? res.statusCode >= 500 || notServed
+            : firstDropBeforeHeaders(ticket);
+          if (!notDelivered) return;
           void Promise.resolve(redeemed.release?.(ticket)).catch(() => {
             /* keep the merchant's failure, not ours */
           });
@@ -555,8 +806,154 @@ export function cantonPaymentMiddleware(
     }
 
     res.setHeader(HEADER_PAYMENT_RESPONSE_V2, encodeBase64Json(settleJson));
+    // PAID, SO PRIVATE. The handler or express.static sets its own
+    // Cache-Control after this point ("public, max-age=86400" for a file), and
+    // a shared cache in front (Cloudflare, nginx) then served the paid body to
+    // the next caller without payment. `private` is merged in as the headers go
+    // out, whatever the handler set; the gate's own no-store goes.
+    if (appCacheControl === undefined) res.removeHeader("Cache-Control");
+    else res.setHeader("Cache-Control", appCacheControl);
+    privateWhenSent(res);
     next();
   };
+
+  // Express 4 does not await a middleware's promise, so a throw in the handler
+  // above was an unhandled rejection that ended the merchant's process. Pass
+  // it to next() as an Error: next(undefined) or next("route") would continue
+  // to the paid route. The returned promise never rejects, so Express 5 cannot
+  // call next a second time.
+  return function middleware(req, res, next) {
+    return Promise.resolve(handle(req, res, next)).catch((err: unknown) => {
+      next(err instanceof Error ? err : new Error("payment middleware failed", { cause: err }));
+    });
+  };
+}
+
+/**
+ * True the first time a payment's ticket is given back for a connection that
+ * dropped before any header went out (see the release listener); false after.
+ * Remembered per process for a day, long enough to outlive any payment's
+ * deadline; bounded so a flood of payments cannot grow it without limit.
+ */
+const dropReleases = new Map<string, number>();
+function firstDropBeforeHeaders(ticket: string): boolean {
+  const now = Date.now();
+  if (dropReleases.has(ticket)) return false;
+  if (dropReleases.size >= 100_000) {
+    for (const [t, at] of dropReleases) if (now - at > 86_400_000) dropReleases.delete(t);
+    if (dropReleases.size >= 100_000) return false;
+  }
+  dropReleases.set(ticket, now);
+  return true;
+}
+
+/**
+ * Merge `private` into the response's Cache-Control as its headers are sent,
+ * whatever the handler set before (as upstream's withPrivateCacheControl).
+ */
+function privateWhenSent(res: Response): void {
+  const writeHead = res.writeHead;
+  let merged = false;
+  const merge = (value: unknown): string => {
+    const v = value == null ? "" : String(value);
+    if (!v) return "private";
+    return v.split(",").some((d) => d.trim().toLowerCase() === "private") ? v : `${v}, private`;
+  };
+  res.writeHead = function (this: Response, ...args: unknown[]) {
+    if (!merged) {
+      // writeHead(status[, message][, headers]): headers passed here win over
+      // setHeader, as an object or as a flat [name, value, ...] array (a proxy
+      // passing upstream rawHeaders). Copied, never edited: the handler may
+      // pass one shared object to free routes too.
+      const i = args.length - 1;
+      const last = args[i];
+      if (Array.isArray(last)) {
+        const flat = [...(last as unknown[])];
+        let found = false;
+        for (let k = 0; k + 1 < flat.length; k += 2) {
+          if (String(flat[k]).toLowerCase() === "cache-control") {
+            flat[k + 1] = merge(flat[k + 1]);
+            found = true;
+          }
+        }
+        if (!found) flat.push("Cache-Control", merge(res.getHeader("Cache-Control")));
+        args[i] = flat;
+      } else if (last && typeof last === "object") {
+        const headers = { ...(last as Record<string, unknown>) };
+        const key = Object.keys(headers).find((k) => k.toLowerCase() === "cache-control");
+        if (key) headers[key] = merge(headers[key]);
+        else res.setHeader("Cache-Control", merge(res.getHeader("Cache-Control")));
+        args[i] = headers;
+      } else {
+        res.setHeader("Cache-Control", merge(res.getHeader("Cache-Control")));
+      }
+    }
+    // Marked only once the headers really went: a writeHead that threw (an
+    // odd-length array) leaves the next call to merge again.
+    const sent = writeHead.apply(this, args as Parameters<Response["writeHead"]>);
+    merged = true;
+    return sent;
+  } as Response["writeHead"];
+}
+
+/**
+ * The path as express.static reads it: percent-escapes decoded, "\\" as "/",
+ * "." and ".." resolved, repeated slashes collapsed, a trailing slash kept.
+ * Null when an escape is malformed; express.static answers 400 to those.
+ */
+function canonicalPath(path: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(path);
+  } catch {
+    return null;
+  }
+  const segments = decoded.replace(/\\/g, "/").split("/");
+  const out: string[] = [];
+  for (const seg of segments) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") out.pop();
+    else out.push(seg);
+  }
+  const last = segments[segments.length - 1];
+  const dir = segments.length > 1 && (last === "" || last === "." || last === "..");
+  return "/" + out.join("/") + (dir && out.length > 0 ? "/" : "");
+}
+
+/**
+ * The method and mount-relative path of the request fetch makes to follow
+ * this redirect, or undefined when fetch does not follow it or the target
+ * leaves this origin or `baseUrl`.
+ */
+function followedRequest(
+  res: Response,
+  method: string,
+  originalUrl: string,
+  baseUrl: string
+): { method: string; path: string } | undefined {
+  const status = res.statusCode;
+  let follow: string;
+  if (status === 301 || status === 302) follow = method === "POST" ? "GET" : method;
+  else if (status === 303) follow = method === "HEAD" ? "HEAD" : "GET";
+  else if (status === 307 || status === 308) follow = method;
+  else return undefined;
+  const location = res.getHeader("location");
+  if (typeof location !== "string") return undefined;
+  let self: URL;
+  let target: URL;
+  try {
+    // The payer sets Host, so this origin is a placeholder only a relative
+    // Location can resolve to.
+    self = new URL(`http://x402.invalid${originalUrl}`);
+    target = new URL(location, self);
+  } catch {
+    return undefined;
+  }
+  if (target.origin !== self.origin || !target.pathname.startsWith(baseUrl)) return undefined;
+  const rest = target.pathname.slice(baseUrl.length);
+  if (rest !== "" && !rest.startsWith("/")) return undefined;
+  // "" is the mount's root without its slash, as the handler reads it.
+  return { method: follow, path: rest };
 }
 
 function respond402WithRequired(

@@ -1,7 +1,7 @@
 {
   "name": "@ftptech/x402-canton-next",
-  "version": "0.2.6",
-  "description": "Next.js App Router wrapper to gate Route Handlers behind Canton x402 payment via a facilitator.",
+  "version": "0.2.8",
+  "description": "Next.js App Router wrapper that charges per request in Canton Coin or a CIP-56 token through an x402 facilitator.",
   "license": "Apache-2.0",
   "author": "FTP team",
   "homepage": "https://github.com/FTP-Tech-LLC/x402-canton-merchant/tree/main/packages/next#readme",
@@ -44,7 +44,7 @@
     "lint": "eslint src --max-warnings 0"
   },
   "dependencies": {
-    "@ftptech/x402-canton-core": "^1.4.0"
+    "@ftptech/x402-canton-core": "^1.9.0"
   },
   "publishConfig": {
     "access": "public"

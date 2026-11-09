@@ -189,6 +189,80 @@ const SHAPES: Shape[] = [
     },
   },
   {
+    name: "strict routing ON, middleware on the app, route on a sub-Router",
+    routeKey: "GET /api/data",
+    build: (mw, served) => {
+      const app = express();
+      app.set("strict routing", true);
+      app.use(mw);
+      const r = express.Router();
+      r.get("/data", (_q, s) => {
+        served();
+        s.json({ ok: true });
+      });
+      app.use("/api", r);
+      return app;
+    },
+  },
+  {
+    name: "case-sensitive routing ON, middleware on the app, route on a sub-Router",
+    routeKey: "GET /api/data",
+    build: (mw, served) => {
+      const app = express();
+      app.set("case sensitive routing", true);
+      app.use(mw);
+      const r = express.Router();
+      r.get("/data", (_q, s) => {
+        served();
+        s.json({ ok: true });
+      });
+      app.use("/api", r);
+      return app;
+    },
+  },
+  {
+    name: "strict routing ON, middleware mounted at /api, route on the app",
+    routeKey: "GET /api/data",
+    build: (mw, served) => {
+      const app = express();
+      app.set("strict routing", true);
+      app.use("/api", mw);
+      app.get("/api/data", (_q, r) => {
+        served();
+        r.json({ ok: true });
+      });
+      return app;
+    },
+  },
+  {
+    name: "case-sensitive routing ON, middleware mounted at /api, route on the app",
+    routeKey: "GET /api/data",
+    build: (mw, served) => {
+      const app = express();
+      app.set("case sensitive routing", true);
+      app.use("/api", mw);
+      app.get("/api/data", (_q, r) => {
+        served();
+        r.json({ ok: true });
+      });
+      return app;
+    },
+  },
+  {
+    name: "strict routing set to the string \"true\"",
+    routeKey: "GET /api/data",
+    build: (mw, served) => {
+      const app = express();
+      app.set("strict routing", "true");
+      app.use(mw);
+      app.get("/api/data", (_q, r) => {
+        served();
+        r.json({ ok: true });
+      });
+      return app;
+    },
+  },
+  {
     name: "nested mounts /v1 -> /api",
     routeKey: "GET /v1/api/data",
     build: (mw, served) => {
@@ -225,6 +299,8 @@ const URLS = [
   "/v1/api/data",
   "/apidata",
   "/api/../api/data",
+  "/api/d%61ta",
+  "/API/data/",
 ];
 
 const METHODS = ["get", "head"] as const;
