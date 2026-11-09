@@ -1,7 +1,7 @@
 {
   "name": "@ftptech/x402-canton-express",
-  "version": "0.2.6",
-  "description": "Express middleware to gate routes behind Canton x402 payment via a facilitator.",
+  "version": "0.2.9",
+  "description": "Express middleware that charges per request in Canton Coin or a CIP-56 token through an x402 facilitator.",
   "license": "Apache-2.0",
   "author": "FTP team",
   "homepage": "https://github.com/FTP-Tech-LLC/x402-canton-merchant/tree/main/packages/express#readme",
@@ -44,7 +44,7 @@
     "lint": "eslint src --max-warnings 0"
   },
   "dependencies": {
-    "@ftptech/x402-canton-core": "^1.4.0"
+    "@ftptech/x402-canton-core": "^1.9.0"
   },
   "peerDependencies": {
     "express": "^4.0.0 || ^5.0.0"
@@ -53,6 +53,7 @@
     "@types/express": "^5.0.0",
     "@types/supertest": "^6.0.2",
     "express": "^5.0.0",
+    "express4": "npm:express@4.22.2",
     "supertest": "^7.0.0"
   },
   "publishConfig": {

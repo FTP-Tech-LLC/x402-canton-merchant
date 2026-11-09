@@ -1,5 +1,24 @@
 # @ftptech/x402-canton-next
 
+## 0.2.8
+
+### Patch Changes
+
+- 0bf13cf: Express refuses at startup a route key that is a pattern (`:id`, `*`, a `[slug]` segment), has no method, or holds `?`, `#` or a space: such a key matched no request, so the paid route was served free. The payment of a payer who leaves during /settle still settles but stays unspent, so a retry of the same payment is served. A connection that drops after the handler started and before any header went out, a client or proxy timeout included, gives the payment back once per process. A retry is then served, and one payment runs the handler at most twice in a process. Responses the middleware sends on a paid route carry `Cache-Control: no-store`. The paid response gets `private` merged into its own Cache-Control, also when headers are passed to `writeHead` as an object or a raw array, so a shared cache cannot serve it to the next caller. Next gives the payment back when the handler returns a 5xx, as it already did when the handler threw, and when the request was aborted before the handler ran.
+- db1d351: The express and next middlewares understand the facilitator's scheme answers. A repeat of a settled payment, refused with its `updateId`, is served through the redeemed store: once, or again after a failed delivery gave the payment back. `settlement_pending`, as a 503 with its body or a 200, is retried with the same payment for about 7 s, then answered 502 "do NOT pay again", never 402. The client reads the reason from PAYMENT-RESPONSE on a 402, where a server on the official x402 SDK puts it, and stops without paying again on `settlement_pending`. A failed SettleResponse in core carries `transaction`, `network` and `payer`.
+- Updated dependencies [db1d351]
+- Updated dependencies [fb41063]
+- Updated dependencies [672bf45]
+- Updated dependencies [cddefd2]
+- Updated dependencies [7f6f15b]
+  - @ftptech/x402-canton-core@1.9.0
+
+## 0.2.7
+
+### Patch Changes
+
+- 8f8e6bf: A PAYMENT-SIGNATURE that decodes to null, an array or a primitive is refused with 400 `malformed PAYMENT-SIGNATURE header`. Before, null threw while reading `accepted`; on Express 4, which does not await middleware, that ended the merchant's process. The Express middleware now also passes any unexpected error to `next(err)`.
+
 ## 0.2.6
 
 ### Patch Changes
@@ -35,14 +54,6 @@
 
 - Updated dependencies [6428700]
   - @ftptech/x402-canton-core@1.0.0
-
-## 0.2.4
-
-### Patch Changes
-
-- Dependency range only.
-- Updated dependencies
-  - @ftptech/x402-canton-core@0.8.0
 
 ## 0.2.3
 

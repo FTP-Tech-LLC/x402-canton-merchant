@@ -111,6 +111,21 @@ interface PaymentPayloadEnvelope {
  */
 let processRedeemed: RedeemedStore | undefined;
 
+/** Waits before each retry of a `settlement_pending` settle: about 7 s in all. */
+const PENDING_RETRY_MS = [1000, 2000, 4000];
+
+/** The body of a 503 /settle when it is the scheme's `settlement_pending`
+ *  answer, else null (a proxy error page, or a facilitator that cannot tell). */
+async function pendingBody(r: Response): Promise<Record<string, unknown> | null> {
+  const body = (await r.json().catch(() => null)) as Record<string, unknown> | null;
+  return body !== null &&
+    typeof body === "object" &&
+    body.success === false &&
+    body.errorReason === "settlement_pending"
+    ? body
+    : null;
+}
+
 export function withCantonPayment<TCtx = unknown>(
   handler: CantonPaymentHandler<TCtx>,
   config: WithCantonPaymentConfig
@@ -134,12 +149,18 @@ export function withCantonPayment<TCtx = unknown>(
       return paymentRequired(request, config);
     }
 
-    let envelope: PaymentPayloadEnvelope;
+    let decoded: unknown;
     try {
-      envelope = decodeBase64Json<PaymentPayloadEnvelope>(sigHeader);
+      decoded = decodeBase64Json<unknown>(sigHeader);
     } catch {
+      decoded = undefined;
+    }
+    // Valid JSON may still be null, an array or a primitive; only an object
+    // is an envelope. Reading `.accepted` of null threw.
+    if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) {
       return jsonError(400, "malformed PAYMENT-SIGNATURE header");
     }
+    const envelope = decoded as PaymentPayloadEnvelope;
 
     // SECURITY (SEC-1): never trust the client-supplied `accepted` block as
     // the payment requirements — pin to this route's configured accepts[].
@@ -188,6 +209,8 @@ export function withCantonPayment<TCtx = unknown>(
     if (!verifyJson.isValid) {
       return paymentRequired(request, config, verifyJson.invalidReason);
     }
+    // The payer left during /verify: settle nothing (see the express middleware).
+    if (request.signal?.aborted) return jsonError(499, "client closed the request; nothing was settled");
 
     // /settle (pre-handler)
     let settleJson: {
@@ -198,51 +221,92 @@ export function withCantonPayment<TCtx = unknown>(
     } & Record<
       string,
       unknown
-    >;
-    try {
-      const r = await fetchImpl(`${facilitatorUrl}/settle`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          x402Version: 2,
-          paymentPayload: envelope,
-          paymentRequirements: requirements,
-        }),
-      });
-      // STATUS FIRST, BODY SECOND — see the express middleware for why: this
-      // check used to sit after `r.json()`, so a non-2xx with a non-JSON body
-      // (the bodyless 502/504 the shipped reverse proxy returns on an upstream
-      // read timeout) threw past the guard into the catch.
-      //
-      // A non-2xx /settle means the facilitator could not determine whether the
-      // submission committed. Answering 402 makes the paying client mint a
-      // SECOND real payment, so answer a transport error and let the caller
-      // retry the SAME envelope.
-      if (!r.ok) {
+    > = {};
+    // A pending settle is retried with the same payment; see the express
+    // middleware.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const r = await fetchImpl(`${facilitatorUrl}/settle`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            x402Version: 2,
+            paymentPayload: envelope,
+            paymentRequirements: requirements,
+          }),
+        });
+        // STATUS FIRST, BODY SECOND — see the express middleware for why: this
+        // check used to sit after `r.json()`, so a non-2xx with a non-JSON body
+        // (the bodyless 502/504 the shipped reverse proxy returns on an upstream
+        // read timeout) threw past the guard into the catch.
+        //
+        // A non-2xx /settle means the facilitator could not determine whether the
+        // submission committed. Answering 402 makes the paying client mint a
+        // SECOND real payment, so answer a transport error and let the caller
+        // retry the SAME envelope.
+        // The scheme's pending answer travels as a 503 with its body (see the
+        // express middleware) and is retried below like a 200 one.
+        if (!r.ok) {
+          const pending = r.status === 503 ? await pendingBody(r) : null;
+          if (!pending) {
+            return jsonError(
+              502,
+              "facilitator could not confirm the payment — do NOT pay again; " +
+                "retry the same payment or check the merchant's receipt"
+            );
+          }
+          settleJson = pending as typeof settleJson;
+        } else {
+          settleJson = (await r.json()) as typeof settleJson;
+        }
+      } catch (err) {
+        // See the express middleware: a connection that was never established
+        // PROVES the request never left this server, so nothing was settled and a
+        // retry is free. Everything else happened with a socket open and the
+        // request possibly delivered — that one stays ambiguous.
+        if (connectionNeverEstablished(err)) {
+          return jsonError(
+            502,
+            "facilitator unreachable on /settle — the request never left this " +
+              "server, so nothing was settled; retry the same payment"
+          );
+        }
         return jsonError(
           502,
           "facilitator could not confirm the payment — do NOT pay again; " +
             "retry the same payment or check the merchant's receipt"
         );
       }
-      settleJson = (await r.json()) as typeof settleJson;
-    } catch (err) {
-      // See the express middleware: a connection that was never established
-      // PROVES the request never left this server, so nothing was settled and a
-      // retry is free. Everything else happened with a socket open and the
-      // request possibly delivered — that one stays ambiguous.
-      if (connectionNeverEstablished(err)) {
-        return jsonError(
-          502,
-          "facilitator unreachable on /settle — the request never left this " +
-            "server, so nothing was settled; retry the same payment"
-        );
+      if (settleJson.errorReason === "settlement_pending" && attempt < PENDING_RETRY_MS.length) {
+        await new Promise((r) => setTimeout(r, PENDING_RETRY_MS[attempt]));
+        if (request.signal?.aborted) return jsonError(499, "client closed the request");
+        continue;
       }
+      break;
+    }
+    if (settleJson.errorReason === "settlement_pending") {
       return jsonError(
         502,
-        "facilitator could not confirm the payment — do NOT pay again; " +
-          "retry the same payment or check the merchant's receipt"
+        "the payment is pending on the ledger — do NOT pay again; retry the same payment shortly"
       );
+    }
+    // A repeat of a settled payment, refused with its updateId by a facilitator
+    // that follows the scheme: the updateId is the ticket the claim below
+    // decides on (see the express middleware). Without a store, a refusal.
+    if (
+      settleJson.success !== true &&
+      settleJson.errorReason === "invalid_exact_canton_payment_already_settled" &&
+      typeof settleJson.transaction === "string" &&
+      settleJson.transaction.length > 0 &&
+      redeemed !== null
+    ) {
+      const { transaction, network, payer } = settleJson;
+      settleJson = {
+        success: true,
+        transaction,
+        ...(network !== undefined ? { network } : {}),
+        ...(payer !== undefined ? { payer } : {}),
+      };
     }
 
     // Positive confirmation only (SEC-1 / M1): a missing or non-`true`
@@ -250,6 +314,9 @@ export function withCantonPayment<TCtx = unknown>(
     if (settleJson.success !== true) {
       return jsonError(402, settleJson.errorReason ?? "settle failed");
     }
+    // Settled, but the payer left: claim nothing and run nothing, so a retry of
+    // the same payment is still served.
+    if (request.signal?.aborted) return jsonError(499, "client closed the request");
 
     // ONE PAYMENT, ONE DELIVERY. The facilitator returns the SAME updateId for
     // every replay of the same signed bytes, so claiming it here is what
@@ -283,6 +350,16 @@ export function withCantonPayment<TCtx = unknown>(
       if (!first) {
         return paymentRequired(request, config, "payment_already_redeemed");
       }
+      // The payer left while the ticket was being claimed: give it back and
+      // run nothing, as before the claim.
+      if (request.signal?.aborted) {
+        try {
+          await redeemed.release?.(ticket);
+        } catch {
+          /* nothing was delivered either way */
+        }
+        return jsonError(499, "client closed the request");
+      }
     }
 
     // Run the handler and clone its response to attach the
@@ -301,23 +378,33 @@ export function withCantonPayment<TCtx = unknown>(
     // The error is re-thrown unchanged. Swallowing it would turn a merchant
     // bug into a silent success, and Next's own error handling is the right
     // place for it.
+    const release = async (): Promise<void> => {
+      if (!redeemed?.release) return;
+      // A store that fails to release must not replace the merchant's real
+      // error with its own; the payer is no worse off than before this fix.
+      try {
+        await redeemed.release(settleJson.transaction as string);
+      } catch {
+        /* keep the original failure */
+      }
+    };
     let original: Response;
     try {
       original = await handler(request, context);
     } catch (err) {
-      if (redeemed?.release) {
-        // A store that fails to release must not replace the merchant's real
-        // error with its own; the payer is no worse off than before this fix.
-        try {
-          await redeemed.release(settleJson.transaction as string);
-        } catch {
-          /* keep the original failure */
-        }
-      }
+      await release();
       throw err;
     }
+    // A 5xx the handler RETURNED is the same failure as one it threw: in Next
+    // an upstream error is usually `return Response.json(..., { status: 502 })`,
+    // which kept the ticket spent, so the payer who paid was refused
+    // payment_already_redeemed on every retry. Express gives it back on 5xx.
+    if (original.status >= 500) await release();
     const headers = new Headers(original.headers);
     headers.set(HEADER_PAYMENT_RESPONSE_V2, encodeBase64Json(settleJson));
+    // Paid, so private: a shared cache in front must not serve this body to the
+    // next caller without payment (as upstream's withPrivateCacheControl).
+    headers.set("Cache-Control", withPrivate(headers.get("Cache-Control")));
     return new Response(original.body, {
       status: original.status,
       statusText: original.statusText,
@@ -345,7 +432,7 @@ function paymentRequired(
     accepts: config.accepts,
     extensions: {},
   };
-  const headers = new Headers({ "Content-Type": "application/json" });
+  const headers = new Headers({ "Content-Type": "application/json", "Cache-Control": "no-store" });
   headers.set(HEADER_PAYMENT_REQUIRED_V2, encodeBase64Json(required));
   return new Response("{}", { status: 402, headers });
 }
@@ -353,6 +440,11 @@ function paymentRequired(
 function jsonError(status: number, error: string): Response {
   return new Response(JSON.stringify({ error }), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
   });
+}
+
+function withPrivate(value: string | null): string {
+  if (!value) return "private";
+  return value.split(",").some((d) => d.trim().toLowerCase() === "private") ? value : `${value}, private`;
 }

@@ -107,6 +107,21 @@ describe("withCantonPayment", () => {
     expect(res.status).toBe(400);
   });
 
+  it("PAYMENT-SIGNATURE that decodes to null, an array or a primitive → 400, no facilitator call", async () => {
+    const fetch = mockFacilitator({ isValid: true }, { success: true, transaction: "upd-1" });
+    const handler = makeHandler({ fetch });
+    for (const value of [null, [], [{ accepted: requirements() }], 0, 7, "x", true, false]) {
+      const res = await handler(
+        new Request("https://app.example.com/api/data", {
+          headers: { [HEADER_PAYMENT_SIGNATURE_V2]: encodeBase64Json(value) },
+        })
+      );
+      expect(res.status, JSON.stringify(value)).toBe(400);
+      expect(await res.json()).toEqual({ error: "malformed PAYMENT-SIGNATURE header" });
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("facilitator unreachable on /verify → 502", async () => {
     const fetch = vi.fn(async () => {
       throw new Error("net down");

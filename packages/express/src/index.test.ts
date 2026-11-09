@@ -1,6 +1,9 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
 import express from "express";
 import request from "supertest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   HEADER_PAYMENT_REQUIRED_V2,
   HEADER_PAYMENT_SIGNATURE_V2,
@@ -129,6 +132,83 @@ describe("cantonPaymentMiddleware", () => {
       .get("/api/data")
       .set(HEADER_PAYMENT_SIGNATURE_V2, "not-base64-json");
     expect(r.status).toBe(400);
+  });
+
+  it("PAYMENT-SIGNATURE that decodes to null, an array or a primitive → 400, no facilitator call", async () => {
+    const fetch = facilitatorMock({ isValid: true }, { success: true, transaction: "upd-1" });
+    const app = buildApp({ facilitatorFetch: fetch });
+    for (const value of [null, [], [{ accepted: requirements() }], 0, 7, "x", true, false]) {
+      const r = await request(app)
+        .get("/api/data")
+        .set(HEADER_PAYMENT_SIGNATURE_V2, encodeBase64Json(value));
+      expect(r.status, JSON.stringify(value)).toBe(400);
+      expect(r.body).toEqual({ error: "malformed PAYMENT-SIGNATURE header" });
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("two PAYMENT-SIGNATURE headers, the first base64 of null → 400", async () => {
+    // Node joins repeated headers with ", " and base64 decoding stops at "=".
+    const fetch = facilitatorMock({ isValid: true }, { success: true, transaction: "upd-1" });
+    const app = buildApp({ facilitatorFetch: fetch });
+    const r = await request(app)
+      .get("/api/data")
+      .set(HEADER_PAYMENT_SIGNATURE_V2, [encodeBase64Json(null), paymentSignature()]);
+    expect(r.status).toBe(400);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("an error inside the middleware goes to next(err) instead of rejecting (Express 4 does not await)", async () => {
+    const middleware = cantonPaymentMiddleware({
+      routes: { "GET /api/data": { accepts: [requirements()] } },
+      facilitatorUrl: FACILITATOR,
+    });
+    const boom = new Error("header read failed");
+    const req = {
+      method: "GET",
+      path: "/api/data",
+      baseUrl: "",
+      originalUrl: "/api/data",
+      header: () => {
+        throw boom;
+      },
+    } as unknown as Parameters<typeof middleware>[0];
+    const next = vi.fn();
+    const returned = middleware(req, {} as Parameters<typeof middleware>[1], next);
+    await expect(Promise.resolve(returned)).resolves.toBeUndefined();
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(next).toHaveBeenCalledWith(boom);
+  });
+
+  it("a redeemed store that rejects without an Error → 500, the paid handler never runs", async () => {
+    // A merchant's own store may reject with nothing. next(undefined) and
+    // next("route") mean "continue", which would serve the paid route.
+    for (const reason of [undefined, null, "route"]) {
+      let served = 0;
+      const app = express();
+      app.use(
+        cantonPaymentMiddleware({
+          routes: { "GET /api/data": { accepts: [requirements()] } },
+          facilitatorUrl: FACILITATOR,
+          fetch: facilitatorMock(
+            { isValid: true, payer: PAYER },
+            { success: true, transaction: "upd-1", payer: PAYER }
+          ),
+          redeemed: { claim: () => Promise.reject(reason) },
+        })
+      );
+      app.get("/api/data", (_req, res) => {
+        served++;
+        res.json({ data: "premium-payload" });
+      });
+      for (let i = 0; i < 2; i++) {
+        const r = await request(app)
+          .get("/api/data")
+          .set(HEADER_PAYMENT_SIGNATURE_V2, paymentSignature());
+        expect(r.status, String(reason)).toBe(500);
+      }
+      expect(served, String(reason)).toBe(0);
+    }
   });
 
   it("facilitator unreachable on /verify → 502", async () => {
@@ -1600,50 +1680,62 @@ describe("the gate must cover everything the express router will serve", () => {
     expect((await request(app).get("/API/data")).status).toBe(404);
   });
 
-  it("gates a paid route on a sub-Router when the app enables strict routing", async () => {
-    // The case the two above were wrong about, and the one that cost a
-    // resource: express.Router() does not inherit the app's flags.
+  it("with strict routing ON, a spelling the flags reject is refused on a sub-Router too", async () => {
+    // An express.Router() does not inherit the app's flags and would serve
+    // /api/data/; the gate cannot tell it from the app's own router, which
+    // answers 404, so it neither charges nor passes the spelling on.
     const app = express();
     app.set("strict routing", true);
     const r = express.Router();
+    const fetch = facilitatorMock(
+      { isValid: true, payer: PAYER },
+      { success: true, transaction: "update-SUBROUTER", payer: PAYER }
+    );
     r.use(
       cantonPaymentMiddleware({
         routes: { "GET /api/data": { accepts: [requirements()] } },
         facilitatorUrl: FACILITATOR,
-        fetch: facilitatorMock({ isValid: false, invalidReason: "nope" }, { success: false }),
+        fetch,
       })
     );
     r.get("/data", (_q, res) => res.json({ data: "premium-payload" }));
     app.use("/api", r);
-    const res = await request(app).get("/api/data/");
-    expect(res.status).toBe(402);
+    const res = await request(app).get("/api/data/").set(HEADER_PAYMENT_SIGNATURE_V2, paymentSignature());
+    expect(res.status).toBe(404);
     expect(res.body).not.toHaveProperty("data");
+    expect(fetch).not.toHaveBeenCalled();
+    const paid = await request(app).get("/api/data").set(HEADER_PAYMENT_SIGNATURE_V2, paymentSignature());
+    expect(paid.status).toBe(200);
+    expect(paid.body).toEqual({ data: "premium-payload" });
   });
 
-  it("and having charged for the mounted loose form, it DELIVERS it", async () => {
-    // The other half of the same rule: gating a path the router will serve is
-    // only correct if paying for it actually gets the resource. A gate that
-    // settles and then 404s is worse than one that never matched.
+  it.each([
+    ["strict routing", "/api/data/"],
+    ["case sensitive routing", "/API/data"],
+  ])("with %s ON and the gate mounted at /api, %s is refused, not charged for a 404", async (flag, path) => {
+    // The paid route is on the app, whose router honours the flag: charging
+    // here was a payment for a 404.
     const app = express();
-    app.set("strict routing", true);
-    const r = express.Router();
-    r.use(
+    app.set(flag, true);
+    const fetch = facilitatorMock(
+      { isValid: true, payer: PAYER },
+      { success: true, transaction: `update-MOUNTED-${flag}`, payer: PAYER }
+    );
+    app.use(
+      "/api",
       cantonPaymentMiddleware({
         routes: { "GET /api/data": { accepts: [requirements()] } },
         facilitatorUrl: FACILITATOR,
-        fetch: facilitatorMock(
-          { isValid: true, payer: PAYER },
-          { success: true, transaction: "update-SUBROUTER", payer: PAYER }
-        ),
+        fetch,
       })
     );
-    r.get("/data", (_q, res) => res.json({ data: "premium-payload" }));
-    app.use("/api", r);
-    const res = await request(app)
-      .get("/api/data/")
-      .set(HEADER_PAYMENT_SIGNATURE_V2, paymentSignature());
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ data: "premium-payload" });
+    app.get("/api/data", (_q, res) => res.json({ data: "premium-payload" }));
+    const res = await request(app).get(path).set(HEADER_PAYMENT_SIGNATURE_V2, paymentSignature());
+    expect(res.status).toBe(404);
+    expect(fetch).not.toHaveBeenCalled();
+    const paid = await request(app).get("/api/data").set(HEADER_PAYMENT_SIGNATURE_V2, paymentSignature());
+    expect(paid.status).toBe(200);
+    expect(paid.body).toEqual({ data: "premium-payload" });
   });
 
   it("two routes that express cannot tell apart are refused at setup", async () => {
@@ -2108,6 +2200,243 @@ describe("a payment that bought nothing gets its ticket back", () => {
     expect(res.status).toBe(404);
     await new Promise((r) => setTimeout(r, 10));
     expect(await redeemed.claim(ticketOf("u-release"))).toBe(false);
+  });
+});
+
+describe("content served by middleware keeps the ticket spent", () => {
+  // req.route is set only by route layers. app.use(path, fn), express.static
+  // and router.use serve a full 200 with it unset, and that used to read as
+  // "not delivered": the ticket went back after every response and one
+  // payment was served again on every replay.
+  const replaying = () =>
+    facilitatorMock({ isValid: true, payer: PAYER }, { success: true, transaction: "u-mw" });
+
+  let dir: string;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "x402-static-"));
+    writeFileSync(join(dir, "report.json"), '{"rows":3}');
+    mkdirSync(join(dir, "reports"));
+    writeFileSync(join(dir, "reports", "index.html"), "<h1>reports</h1>");
+  });
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function gated(
+    mount: (app: express.Express) => void,
+    redeemed: ReturnType<typeof createInMemoryRedeemedStore>
+  ) {
+    const app = express();
+    app.use(
+      cantonPaymentMiddleware({
+        routes: { "GET /paid/report.json": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch: replaying(),
+        redeemed,
+      })
+    );
+    mount(app);
+    return app;
+  }
+
+  async function serveTwice(app: express.Express) {
+    const hdr = paymentSignature();
+    const first = await request(app).get("/paid/report.json").set(HEADER_PAYMENT_SIGNATURE_V2, hdr);
+    await new Promise((r) => setTimeout(r, 10));
+    const replay = await request(app).get("/paid/report.json").set(HEADER_PAYMENT_SIGNATURE_V2, hdr);
+    return { first, replay };
+  }
+
+  function redeemedError(res: request.Response): string | undefined {
+    const h = res.headers[HEADER_PAYMENT_REQUIRED_V2.toLowerCase()] as string | undefined;
+    return h ? decodeBase64Json<{ error?: string }>(h).error : undefined;
+  }
+
+  it("app.use(path, fn): served once, the replay is refused", async () => {
+    const app = gated((a) => {
+      a.use("/paid/report.json", (_req, res) => {
+        res.json({ rows: 3 });
+      });
+    }, createInMemoryRedeemedStore());
+    const { first, replay } = await serveTwice(app);
+    expect(first.status).toBe(200);
+    expect(replay.status).toBe(402);
+    expect(redeemedError(replay)).toBe("payment_already_redeemed");
+  });
+
+  it("express.static: served once, the replay is refused", async () => {
+    const app = gated((a) => {
+      a.use("/paid", express.static(dir));
+    }, createInMemoryRedeemedStore());
+    const { first, replay } = await serveTwice(app);
+    expect(first.status).toBe(200);
+    expect(first.text).toBe('{"rows":3}');
+    expect(replay.status).toBe(402);
+    expect(redeemedError(replay)).toBe("payment_already_redeemed");
+  });
+
+  it("router.use: served once, the replay is refused", async () => {
+    const app = gated((a) => {
+      const r = express.Router();
+      r.use((_req, res) => {
+        res.json({ rows: 3 });
+      });
+      a.use("/paid", r);
+    }, createInMemoryRedeemedStore());
+    const { first, replay } = await serveTwice(app);
+    expect(first.status).toBe(200);
+    expect(replay.status).toBe(402);
+    expect(redeemedError(replay)).toBe("payment_already_redeemed");
+  });
+
+  it("express.static with no such file is a router miss and gives the ticket back", async () => {
+    const redeemed = createInMemoryRedeemedStore();
+    const app = gated((a) => {
+      a.use("/paid", express.static(join(dir, "empty")));
+    }, redeemed);
+    const res = await request(app)
+      .get("/paid/report.json")
+      .set(HEADER_PAYMENT_SIGNATURE_V2, paymentSignature());
+    expect(res.status).toBe(404);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(await redeemed.claim("u-mw")).toBe(true);
+  });
+
+  it("express.static redirecting a directory gives the ticket back, so the followed request is served", async () => {
+    const settles: string[] = [];
+    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/verify")) {
+        return new Response(JSON.stringify({ isValid: true, payer: PAYER }), { status: 200 });
+      }
+      settles.push(String(init?.body));
+      return new Response(JSON.stringify({ success: true, transaction: "u-dir" }), { status: 200 });
+    }) as typeof globalThis.fetch;
+    const store = createInMemoryRedeemedStore();
+    const release = vi.fn((ticket: string) => store.release?.(ticket));
+    const app = express();
+    app.use(
+      cantonPaymentMiddleware({
+        routes: { "GET /reports": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch,
+        redeemed: { claim: store.claim, release },
+      })
+    );
+    app.use(express.static(dir));
+    const hdr = paymentSignature();
+
+    const first = await request(app).get("/reports").set(HEADER_PAYMENT_SIGNATURE_V2, hdr);
+    expect(first.status).toBe(301);
+    expect(first.headers.location).toBe("/reports/");
+    await vi.waitFor(() => expect(release).toHaveBeenCalledWith("u-dir"));
+
+    // fetch follows the redirect with the same PAYMENT-SIGNATURE.
+    const followed = await request(app).get("/reports/").set(HEADER_PAYMENT_SIGNATURE_V2, hdr);
+    expect(followed.status).toBe(200);
+    expect(followed.text).toBe("<h1>reports</h1>");
+    // Both /settle calls carry the same signed payment: one settle, replayed.
+    expect(settles).toHaveLength(2);
+    expect(new Set(settles).size).toBe(1);
+  });
+
+  it("a middleware redirect to another origin keeps the ticket spent, since the redirect may be the delivery", async () => {
+    let n = 0;
+    const app = gated((a) => {
+      a.use("/paid", (_req, res) => {
+        res.redirect(302, `https://bucket.example/paid/report.json?sig=${++n}`);
+      });
+    }, createInMemoryRedeemedStore());
+    const { first, replay } = await serveTwice(app);
+    expect(first.status).toBe(302);
+    expect(replay.status).toBe(402);
+    expect(redeemedError(replay)).toBe("payment_already_redeemed");
+  });
+
+  it("a middleware redirect to a same-origin path the gate does not cover keeps the ticket spent", async () => {
+    const app = gated((a) => {
+      a.use("/paid", (_req, res) => {
+        res.redirect("/free/report.json");
+      });
+    }, createInMemoryRedeemedStore());
+    const { first, replay } = await serveTwice(app);
+    expect(first.status).toBe(302);
+    expect(replay.status).toBe(402);
+    expect(redeemedError(replay)).toBe("payment_already_redeemed");
+  });
+
+  it("an absolute Location never counts as this origin, whatever the Host header says", async () => {
+    // The payer sets Host. Trusting it would hand the ticket back for a signed
+    // URL on another origin whose path mirrors the gated one.
+    const app = gated((a) => {
+      a.use("/paid", (_req, res) => {
+        res.redirect(302, "http://bucket.example/paid/report.json?sig=1");
+      });
+    }, createInMemoryRedeemedStore());
+    const hdr = paymentSignature();
+    const send = () =>
+      request(app)
+        .get("/paid/report.json")
+        .set("Host", "bucket.example")
+        .set(HEADER_PAYMENT_SIGNATURE_V2, hdr);
+    expect((await send()).status).toBe(302);
+    await new Promise((r) => setTimeout(r, 10));
+    const replay = await send();
+    expect(replay.status).toBe(402);
+    expect(redeemedError(replay)).toBe("payment_already_redeemed");
+  });
+
+  it("a POST answered 303 is followed as a GET, so a gate on the POST alone keeps the ticket spent", async () => {
+    const app = express();
+    app.use(
+      cantonPaymentMiddleware({
+        routes: { "POST /paid/report.json": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch: replaying(),
+        redeemed: createInMemoryRedeemedStore(),
+      })
+    );
+    app.use("/paid", (_req, res) => {
+      res.redirect(303, "/paid/report.json");
+    });
+    const hdr = paymentSignature();
+    const send = () => request(app).post("/paid/report.json").set(HEADER_PAYMENT_SIGNATURE_V2, hdr);
+    expect((await send()).status).toBe(303);
+    await new Promise((r) => setTimeout(r, 10));
+    const replay = await send();
+    expect(replay.status).toBe(402);
+    expect(redeemedError(replay)).toBe("payment_already_redeemed");
+  });
+
+  it("a middleware redirect out of the gate's mount keeps the ticket spent", async () => {
+    const app = express();
+    app.use(
+      "/paid",
+      cantonPaymentMiddleware({
+        routes: { "GET /report.json": { accepts: [requirements()] } },
+        facilitatorUrl: FACILITATOR,
+        fetch: replaying(),
+        redeemed: createInMemoryRedeemedStore(),
+      })
+    );
+    app.use("/paid", (_req, res) => {
+      res.redirect("/report.json");
+    });
+    const { first, replay } = await serveTwice(app);
+    expect(first.status).toBe(302);
+    expect(replay.status).toBe(402);
+    expect(redeemedError(replay)).toBe("payment_already_redeemed");
+  });
+
+  it("a route handler's redirect keeps the ticket spent", async () => {
+    const app = gated((a) => {
+      a.get("/paid/report.json", (_req, res) => {
+        res.redirect("/elsewhere");
+      });
+    }, createInMemoryRedeemedStore());
+    const { first, replay } = await serveTwice(app);
+    expect(first.status).toBe(302);
+    expect(replay.status).toBe(402);
+    expect(redeemedError(replay)).toBe("payment_already_redeemed");
   });
 });
 
