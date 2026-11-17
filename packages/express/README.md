@@ -63,6 +63,7 @@ app.listen(3000);
 - Mount it on the app with `app.use()`, before your routers and anything that rewrites `req.url`. A request it never sees is served free.
 - One payment, one response: a replay gets 402 `payment_already_redeemed`. With several processes, pass one shared `redeemed` store; otherwise the same payment is served once per process.
 - Settlement runs before your handler. If the handler answers 5xx, the payer can retry the same payment.
+- Mount auth and body parsers before the gate: a request they reject is never charged. After it, a 4xx from middleware gives the payment back once per process; inside a route (`app.post(path, express.json(), handler)`) it counts as served.
 - A 502 means the facilitator could not confirm the payment, for example `settlement_pending`. The payer retries the same payment and never pays again.
 - The payment header is 8 to 10 KiB. Every proxy in front must accept 16 KiB: nginx `large_client_header_buffers 4 16k;`, Node `--max-http-header-size=32768`.
 - The preapproval lasts 30 days, and payments to an expired one fail. Run `preapproval` again before then; `--force` renews early.

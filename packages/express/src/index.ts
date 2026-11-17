@@ -780,23 +780,33 @@ export function cantonPaymentMiddleware(
           // spent on nothing — which is exactly the hole the loose route index
           // can open when it charges for a path the router then declines.
           //
-          // So a 404 from middleware (`req.route` unset) returns the ticket, and
-          // so does a middleware redirect that fetch follows back through this
-          // gate, where the followed request claims it or, with the routing
-          // flags on, is refused (express.static's redirect from /files/docs to
-          // /files/docs/). Any other 3xx, and a route handler's, keeps it spent:
+          // So a 4xx from middleware (`req.route` unset: a 404 from the router,
+          // a 401 from auth or a 400 from a body parser mounted with app.use
+          // after this gate) returns the ticket, ONCE per ticket in this
+          // process: a handler mounted with app.use may answer a 4xx as its
+          // paid answer (a 409 "taken", a 404 "not registered"), and the
+          // payment is not bound to the query, so returning it every time would
+          // let one payment buy any number of those answers. One return keeps
+          // the payer's retry. So does a middleware redirect that fetch follows
+          // back through this gate, where the followed request claims it or,
+          // with the routing flags on, is refused (express.static's redirect
+          // from /files/docs to /files/docs/). Any other 3xx, and a route
+          // handler's, keeps it spent:
           // a redirect elsewhere may be the delivery itself (a signed download
           // URL).
           const followed = followedRequest(res, method, req.originalUrl, baseUrl);
-          const notServed =
+          // Only for a response that went out: a drop has its own rule below.
+          const notServed = (): boolean =>
             req.route === undefined &&
-            (res.statusCode === 404 ||
+            ((res.statusCode >= 400 &&
+              res.statusCode < 500 &&
+              firstRelease(middleware4xxReleases, ticket)) ||
               (followed !== undefined &&
                 (gated(followed.method, followed.path) !== undefined ||
                   ((strict || caseSensitive) && looseGated(followed.method, followed.path) !== undefined))));
           const notDelivered = res.headersSent
-            ? res.statusCode >= 500 || notServed
-            : firstDropBeforeHeaders(ticket);
+            ? res.statusCode >= 500 || notServed()
+            : firstRelease(dropReleases, ticket);
           if (!notDelivered) return;
           void Promise.resolve(redeemed.release?.(ticket)).catch(() => {
             /* keep the merchant's failure, not ours */
@@ -830,20 +840,22 @@ export function cantonPaymentMiddleware(
 }
 
 /**
- * True the first time a payment's ticket is given back for a connection that
- * dropped before any header went out (see the release listener); false after.
- * Remembered per process for a day, long enough to outlive any payment's
- * deadline; bounded so a flood of payments cannot grow it without limit.
+ * Tickets already given back once, for a connection that dropped before any
+ * header went out and for a 4xx from middleware (see the release listener). Remembered per process for a day, long enough to outlive any
+ * payment's deadline; bounded so a flood of payments cannot grow them without
+ * limit.
  */
 const dropReleases = new Map<string, number>();
-function firstDropBeforeHeaders(ticket: string): boolean {
+const middleware4xxReleases = new Map<string, number>();
+/** True the first time `ticket` is recorded in `seen`; false after. */
+function firstRelease(seen: Map<string, number>, ticket: string): boolean {
   const now = Date.now();
-  if (dropReleases.has(ticket)) return false;
-  if (dropReleases.size >= 100_000) {
-    for (const [t, at] of dropReleases) if (now - at > 86_400_000) dropReleases.delete(t);
-    if (dropReleases.size >= 100_000) return false;
+  if (seen.has(ticket)) return false;
+  if (seen.size >= 100_000) {
+    for (const [t, at] of seen) if (now - at > 86_400_000) seen.delete(t);
+    if (seen.size >= 100_000) return false;
   }
-  dropReleases.set(ticket, now);
+  seen.set(ticket, now);
   return true;
 }
 
