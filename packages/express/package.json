@@ -44,17 +44,17 @@
     "lint": "eslint src --max-warnings 0"
   },
   "dependencies": {
-    "@ftptech/x402-canton-core": "^1.9.0"
+    "@ftptech/x402-canton-core": "^1.9.2"
   },
   "peerDependencies": {
     "express": "^4.0.0 || ^5.0.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
-    "@types/supertest": "^6.0.2",
-    "express": "^5.0.0",
+    "@types/supertest": "^7.2.1",
+    "express": "^5.3.0",
     "express4": "npm:express@4.22.2",
-    "supertest": "^7.0.0"
+    "supertest": "^7.3.2"
   },
   "publishConfig": {
     "access": "public"
