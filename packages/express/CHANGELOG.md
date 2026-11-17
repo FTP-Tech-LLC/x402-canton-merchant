@@ -1,5 +1,11 @@
 # @ftptech/x402-canton-express
 
+## 0.2.10
+
+### Patch Changes
+
+- A 4xx from middleware mounted with `app.use` or `router.use` after the gate, such as a 401 from auth or a 400 from a body parser, now gives the payment back once per process. The payer can fix the request and retry with the same payment. Before, only a 404 did, and on every request. A 404 is now given back once too: a handler mounted with `app.use` may answer a 4xx or a 404 as its paid answer, and the payment is not bound to the query. A 4xx from a route (`app.get`, `app.post`, including middleware listed in the route) still counts as served. Tested on Express 4 and 5.
+
 ## 0.2.9
 
 ### Patch Changes

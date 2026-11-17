@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import express from "express";
+import { createRequire } from "node:module";
 import http from "node:http";
 import { createInMemoryRedeemedStore, encodeBase64Json } from "@ftptech/x402-canton-core";
 import { cantonPaymentMiddleware } from "./index.js";
@@ -41,34 +42,74 @@ describe("the release listener on a real socket with keep-alive", () => {
     },
   };
 
-  const facilitatorFetch = (async (url: string) => {
-    if (String(url).endsWith("/verify"))
-      return new Response(JSON.stringify({ isValid: true, payer: PAYER }), { status: 200 });
-    return new Response(
-      JSON.stringify({ success: true, transaction: "u-live", payer: PAYER }),
-      { status: 200 }
-    );
-  }) as unknown as typeof fetch;
+  // A ticket of its own per app: the gate remembers once-only give-backs per
+  // ticket for the life of the process.
+  let seq = 0;
+  const facilitatorFor = (transaction: string) =>
+    (async (url: string) => {
+      if (String(url).endsWith("/verify"))
+        return new Response(JSON.stringify({ isValid: true, payer: PAYER }), { status: 200 });
+      return new Response(JSON.stringify({ success: true, transaction, payer: PAYER }), {
+        status: 200,
+      });
+    }) as unknown as typeof fetch;
 
-  async function run(handler: express.RequestHandler, path: string) {
+  // Express 4 too: the peer range allows it, and its routing sets req.route
+  // the same way only if we check.
+  const express4 = createRequire(import.meta.url)("express4") as typeof express;
+
+  /** One app behind the gate; `get` sends one paid request, every time with
+   *  the same payment. */
+  async function serve(
+    handler: express.RequestHandler,
+    path: string,
+    o: { after?: express.RequestHandler; lib?: typeof express } = {}
+  ) {
+    const tx = `u-live-${++seq}`;
     const redeemed = createInMemoryRedeemedStore();
-    const app = express();
+    const app = (o.lib ?? express)();
     app.use(
       cantonPaymentMiddleware({
         routes: {
           [`GET ${path}`]: { accepts: [REQ] },
         },
         facilitatorUrl: "http://fac.test",
-        fetch: facilitatorFetch,
+        fetch: facilitatorFor(tx),
         redeemed,
       })
     );
+    if (o.after) app.use(o.after);
     if (handler) app.get(path, handler);
     const server = http.createServer(app);
     await new Promise<void>((r) => server.listen(0, r));
     const port = (server.address() as { port: number }).port;
     const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
-    const status = await new Promise<number>((resolve, reject) => {
+    const get = async (): Promise<number> => {
+      const status = await send(port, path, agent);
+      await new Promise((r) => setTimeout(r, 60));
+      return status;
+    };
+    const close = async () => {
+      agent.destroy();
+      await new Promise<void>((r) => server.close(() => r()));
+    };
+    return { get, close, released: () => redeemed.claim(tx) };
+  }
+
+  async function run(
+    handler: express.RequestHandler,
+    path: string,
+    o: { after?: express.RequestHandler; lib?: typeof express } = {}
+  ) {
+    const s = await serve(handler, path, o);
+    const status = await s.get();
+    const stillFree = await s.released();
+    await s.close();
+    return { status, released: stillFree };
+  }
+
+  function send(port: number, path: string, agent: http.Agent): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
       const req = http.request(
         {
           port, path, method: "GET", agent,
@@ -88,11 +129,6 @@ describe("the release listener on a real socket with keep-alive", () => {
       req.on("error", reject);
       req.end();
     });
-    await new Promise((r) => setTimeout(r, 60));
-    const stillFree = await redeemed.claim("u-live");
-    agent.destroy();
-    await new Promise<void>((r) => server.close(() => r()));
-    return { status, released: stillFree };
   }
 
   it("a served request keeps the ticket spent", async () => {
@@ -111,5 +147,65 @@ describe("the release listener on a real socket with keep-alive", () => {
     const r = await run(undefined as unknown as express.RequestHandler, "/paid");
     expect(r.status).toBe(404);
     expect(r.released).toBe(true);
+  });
+
+  const served: express.RequestHandler = (_q, res) => {
+    res.json({ ok: true });
+  };
+  const denyAuth: express.RequestHandler = (_q, res) => {
+    res.status(401).json({ error: "unauthorized" });
+  };
+  const badBody: express.RequestHandler = (_q, res) => {
+    res.status(400).json({ error: "bad body" });
+  };
+
+  it("a 401 from auth middleware after the gate gives the ticket back", async () => {
+    const r = await run(served, "/paid", { after: denyAuth });
+    expect(r.status).toBe(401);
+    expect(r.released).toBe(true);
+  });
+
+  it("a 400 from middleware after the gate gives it back", async () => {
+    const r = await run(served, "/paid", { after: badBody });
+    expect(r.status).toBe(400);
+    expect(r.released).toBe(true);
+  });
+
+  it("a second middleware 4xx on the same payment keeps it spent", async () => {
+    // A handler mounted with app.use may answer a 4xx as its paid answer; the
+    // payment is not bound to the query, so it is given back only once.
+    const s = await serve(served, "/paid", { after: denyAuth });
+    expect(await s.get()).toBe(401); // given back: the retry gets through
+    expect(await s.get()).toBe(401); // not again
+    expect(await s.released()).toBe(false);
+    await s.close();
+  });
+
+  it("a 404 from the router is given back once too", async () => {
+    // An app.use handler's own 404 ("not registered") looks the same to the
+    // gate, and it may be the paid answer.
+    const s = await serve(undefined as unknown as express.RequestHandler, "/paid");
+    expect(await s.get()).toBe(404); // given back
+    expect(await s.get()).toBe(404); // not again
+    expect(await s.released()).toBe(false);
+    await s.close();
+  });
+
+  it("a 4xx the route handler chose keeps it spent: the handler answered", async () => {
+    const r = await run((_q, res) => { res.status(403).json({ error: "no such record" }); }, "/paid");
+    expect(r.status).toBe(403);
+    expect(r.released).toBe(false);
+  });
+
+  it("Express 4: middleware 401 gives the ticket back, a served route keeps it", async () => {
+    const denied = await run(served, "/paid", { after: denyAuth, lib: express4 });
+    expect(denied.status).toBe(401);
+    expect(denied.released).toBe(true);
+    const ok = await run(served, "/paid", { lib: express4 });
+    expect(ok.status).toBe(200);
+    expect(ok.released).toBe(false);
+    const missing = await run(undefined as unknown as express.RequestHandler, "/paid", { lib: express4 });
+    expect(missing.status).toBe(404);
+    expect(missing.released).toBe(true);
   });
 });

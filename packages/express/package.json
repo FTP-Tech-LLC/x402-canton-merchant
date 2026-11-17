@@ -1,6 +1,6 @@
 {
   "name": "@ftptech/x402-canton-express",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "Express middleware that charges per request in Canton Coin or a CIP-56 token through an x402 facilitator.",
   "license": "Apache-2.0",
   "author": "FTP team",
