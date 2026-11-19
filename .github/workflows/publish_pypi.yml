@@ -1,0 +1,36 @@
+name: Publish Python to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'python/v')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./python
+    environment:
+      name: pypi
+      url: https://pypi.org/p/ftptech-x402-canton
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ">=0.13.4"
+      - name: Build
+        run: uv build
+      - name: Check that the release tag matches the package version
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: test "$TAG" = "python/v$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)"
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: python/dist/
