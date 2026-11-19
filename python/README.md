@@ -7,10 +7,10 @@ It charges only when your handler answers 2xx, and it delivers each payment once
 ## Install
 
 ```bash
-pip install "ftptech-x402-canton[fastapi,redis] @ git+https://github.com/FTP-Tech-LLC/x402-canton-merchant@python/v0.1.0#subdirectory=python"
+pip install "ftptech-x402-canton[fastapi,redis]"
 ```
 
-Extras: `fastapi`, `flask`, `redis`. Python 3.10 or newer, `x402` 2.28. The git line and the docs link below work once the `python/v0.1.0` tag is published.
+Extras: `fastapi`, `flask`, `redis`. Python 3.10 or newer, `x402` 2.28.
 
 ## Before you start
 
