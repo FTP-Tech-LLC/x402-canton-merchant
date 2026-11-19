@@ -1,6 +1,6 @@
 [project]
 name = "ftptech-x402-canton"
-version = "0.1.0"
+version = "0.1.1"
 description = "Canton x402 merchant plugin for the official x402 Python SDK (FastAPI, Flask)"
 readme = "README.md"
 license = "Apache-2.0"
