@@ -7,7 +7,7 @@ Charge per HTTP request in Canton Coin or a CIP-56 token. Middleware for Express
 | [`@ftptech/x402-canton-express`](packages/express/README.md) | `npm i @ftptech/x402-canton-express` |
 | [`@ftptech/x402-canton-next`](packages/next/README.md) | `npm i @ftptech/x402-canton-next` |
 | [Go: net/http, gin, echo](go/README.md) | `go get github.com/FTP-Tech-LLC/x402-canton-merchant/go/canton` |
-| [Python: FastAPI, Flask](python/README.md) | `pip install "ftptech-x402-canton[fastapi] @ git+https://github.com/FTP-Tech-LLC/x402-canton-merchant@python/v0.1.0#subdirectory=python"` |
+| [Python: FastAPI, Flask](python/README.md) | `pip install "ftptech-x402-canton[fastapi]"` |
 
 ## Quickstart
 
