@@ -1,11 +1,13 @@
 # x402-canton-merchant
 
-Charge per HTTP request in Canton Coin or a CIP-56 token. Middleware for Express and the Next.js App Router; FTP's facilitator settles the payments.
+Charge per HTTP request in Canton Coin or a CIP-56 token. Middleware for Express and the Next.js App Router, and plugins for the official x402 Go and Python SDKs. FTP's facilitator settles the payments.
 
 | Package | Install |
 | --- | --- |
 | [`@ftptech/x402-canton-express`](packages/express/README.md) | `npm i @ftptech/x402-canton-express` |
 | [`@ftptech/x402-canton-next`](packages/next/README.md) | `npm i @ftptech/x402-canton-next` |
+| [Go: net/http, gin, echo](go/README.md) | `go get github.com/FTP-Tech-LLC/x402-canton-merchant/go/canton` |
+| [Python: FastAPI, Flask](python/README.md) | `pip install "ftptech-x402-canton[fastapi] @ git+https://github.com/FTP-Tech-LLC/x402-canton-merchant@python/v0.1.0#subdirectory=python"` |
 
 ## Quickstart
 
@@ -17,7 +19,7 @@ Charge per HTTP request in Canton Coin or a CIP-56 token. Middleware for Express
    npx @ftptech/canton-agent-wallet claim
    npx @ftptech/canton-agent-wallet preapproval
    ```
-2. Gate a route: copy the example from the [Express](packages/express/README.md#example) or [Next.js](packages/next/README.md#example) README and set `payTo` and `amount`.
+2. Gate a route: copy the example from the [Express](packages/express/README.md#quickstart), [Next.js](packages/next/README.md#quickstart), [Go](go/README.md#quickstart) or [Python](python/README.md#quickstart) README and set `payTo` and the price.
 
 Full guide: [x402-docs.ftptech.xyz/x402-merchant](https://x402-docs.ftptech.xyz/x402-merchant).
 
